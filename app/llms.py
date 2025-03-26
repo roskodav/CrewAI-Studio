@@ -19,6 +19,10 @@ def load_secrets_fron_env():
             "ANTHROPIC_API_KEY": os.getenv("ANTHROPIC_API_KEY"),
             "OLLAMA_HOST": os.getenv("OLLAMA_HOST"),
             "XAI_API_KEY": os.getenv("XAI_API_KEY"),
+            "OPENAI_AZURE_API_KEY": os.getenv("OPENAI_AZURE_API_KEY"),
+            "OPENAI_AZURE_API_BASE": os.getenv("OPENAI_AZURE_API_BASE"),
+            "OPENAI_AZURE_API_VERSION": os.getenv("OPENAI_AZURE_API_VERSION"),
+            "OPENAI_AZURE_MODELS": os.getenv("OPENAI_AZURE_MODELS"),
         }
     else:
         st.session_state.env_vars = st.session_state.env_vars
@@ -126,6 +130,21 @@ def create_lmstudio_llm(model, temperature):
         )
     else:
         raise ValueError("LM Studio API base not set in .env file")
+    
+def create_openai_azure_llm(model, temperature):
+    switch_environment({
+        "OPENAI_API_KEY": st.session_state.env_vars["OPENAI_AZURE_API_KEY"],
+        "OPENAI_API_BASE": st.session_state.env_vars["OPENAI_AZURE_API_BASE"],
+        "OPENAI_API_VERSION": st.session_state.env_vars["OPENAI_AZURE_API_VERSION"],
+    })
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise ValueError("OpenAI Azure API key not set in .env file")
+    return LLM(
+        model=model,
+        temperature=temperature,
+        base_url=os.getenv("OPENAI_API_BASE")
+    )
 
 LLM_CONFIG = {
     "OpenAI": {
@@ -151,6 +170,10 @@ LLM_CONFIG = {
      "Xai": {
         "models": ["xai/grok-2-1212", "xai/grok-beta"],
         "create_llm": create_xai_llm,
+    },    
+    "OpenAI Azure": {
+        "models": os.getenv("OPENAI_AZURE_MODELS", "azure/gpt-4o").split(","),
+        "create_llm": create_openai_azure_llm,
     },
 }
 
