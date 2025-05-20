@@ -1,4 +1,3 @@
-version: '3.9'
 
 services:
   db:
@@ -11,7 +10,8 @@ services:
       POSTGRES_PASSWORD: secret
       POSTGRES_DB: crewai
     volumes:
-      - ./data:/var/lib/postgresql/data
+     # - ./data:/var/lib/postgresql/data #QA
+      - ./data_trade:/var/lib/postgresql/data #QA
     ports:
       - "5432:5432"
 
@@ -21,9 +21,14 @@ services:
     container_name: crewai_studio
     depends_on:
       - db
-    env_file:
-      - .env
+    env_file: .env
     environment:
       - DB_URL=postgresql://crewai_user:secret@db:5432/crewai
+      - DOCKER_HOST=tcp://host.docker.internal:2375
+    volumes:
+      - ./crewai_workspace:/CrewAI-Studio/workspace
     ports:
       - "8501:8501"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    privileged: true

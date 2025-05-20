@@ -1,0 +1,4637 @@
+File: C:\Projects\CrewAI-Studio\.github\FUNDING.yml
+# These are supported funding model platforms
+
+github: [strnad]
+custom: ["https://pay-link.s3.us-west-2.amazonaws.com/index.html?uid=b14b42846ecd40fe"]
+
+----------------------------------
+File: C:\Projects\CrewAI-Studio\.streamlit\config.toml
+[browser]
+gatherUsageStats = false
+
+[theme]
+primaryColor="#f05252"
+backgroundColor="#111111"
+secondaryBackgroundColor="#222222"
+textColor="#dddddd"
+base = "dark"
+----------------------------------
+File: C:\Projects\CrewAI-Studio\app\tools\AzureAIAssistantTool.py
+# src/tester_crew/tools/azure_ai_assistant.py
+import os
+import json
+import time
+import logging
+from typing import Optional, Dict, List, Any
+from azure.identity import DefaultAzureCredential
+from openai import AzureOpenAI
+from pydantic import Field, ConfigDict, ValidationError
+from crewai.tools import BaseTool
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class AzureAIAssistantTool(BaseTool):
+    name: str = Field(default="Azure AI Assistant")
+    description: str = Field(
+        default="Interacts with Azure OpenAI Assistants for knowledge retrieval",
+    )
+    api_version: str = Field(default="2024-05-01-preview")
+    assistant_name: Optional[str] = Field(default=None)
+    assistant_config: List[Dict] = Field(default_factory=list)
+    client: Any = Field(default=None)
+    assistant_id: str = Field(default="")
+    api_key: Optional[str] = Field(default=None)
+    max_wait_time: int = Field(default=300, description="Maximum wait time in seconds for completion")
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._validate_config()
+        self.client = self._initialize_client()
+        self.assistant_id = self._get_assistant_id(self.assistant_name)
+        logger.info(f"Initialized Azure AI Assistant with ID: {self.assistant_id}")
+
+    def _validate_config(self):
+        """Validate configuration parameters"""
+        if not os.getenv("AZURE_OPENAI_ENDPOINT"):
+            raise ValueError("AZURE_OPENAI_ENDPOINT environment variable is required")
+        
+        try:
+            self.assistant_config = json.loads(os.getenv("OPENAI_ASSISTANTS", "[]"))
+        except json.JSONDecodeError as e:
+            raise ValueError("Invalid JSON in OPENAI_ASSISTANTS environment variable") from e
+
+        if not isinstance(self.assistant_config, list):
+            raise ValueError("OPENAI_ASSISTANTS should contain a JSON array of assistants")
+
+    def _get_assistant_id(self, name: Optional[str]) -> str:
+        """Get assistant ID from configuration"""
+        if not self.assistant_config:
+            raise ValueError("No assistants configured in OPENAI_ASSISTANTS")
+        
+        if name:
+            for assistant in self.assistant_config:
+                if assistant.get("title") == name:
+                    return assistant["id"]
+            raise ValueError(f"Assistant '{name}' not found in configuration")
+        
+        return self.assistant_config[0]["id"]
+
+    def _initialize_client(self):
+        """Initialize Azure OpenAI client with multiple authentication options"""
+        endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+        
+        # Try API key first if provided
+        if self.api_key:
+            logger.info("Using API key authentication")
+            return AzureOpenAI(
+                api_key=self.api_key,
+                azure_endpoint=endpoint,
+                api_version=self.api_version
+            )
+        
+        # Fallback to Azure AD authentication
+        try:
+            logger.info("Using Azure AD authentication")
+            token_provider = DefaultAzureCredential()
+            return AzureOpenAI(
+                azure_ad_token_provider=lambda: token_provider.get_token(
+                    "https://cognitiveservices.azure.com/.default"
+                ).token,
+                azure_endpoint=endpoint,
+                api_version=self.api_version
+            )
+        except Exception as e:
+            raise RuntimeError("Failed to initialize Azure OpenAI client") from e
+
+    def _process_message(self, thread_id: str, run_id: str) -> str:
+        """Monitor and process the assistant run with timeout"""
+        start_time = time.time()
+        
+        while time.time() - start_time < self.max_wait_time:
+            try:
+                run = self.client.beta.threads.runs.retrieve(
+                    thread_id=thread_id,
+                    run_id=run_id
+                )
+                logger.debug(f"Run status: {run.status}")
+
+                if run.status == 'completed':
+                    messages = self.client.beta.threads.messages.list(
+                        thread_id=thread_id,
+                        order="asc"
+                    )
+                    return self._extract_response(messages.data)
+                
+                if run.status in ['failed', 'cancelled', 'expired']:
+                    error_msg = run.last_error.message if run.last_error else "Unknown error"
+                    raise RuntimeError(f"Assistant run failed: {error_msg}")
+                
+                if run.status == 'requires_action':
+                    raise RuntimeError("Assistant requires action which is not implemented")
+                
+                time.sleep(5)
+            
+            except Exception as e:
+                logger.error(f"Error processing message: {str(e)}")
+                raise
+
+        raise TimeoutError(f"Assistant did not complete within {self.max_wait_time} seconds")
+
+    def _extract_response(self, messages: List[Any]) -> str:
+        """Extract and format the assistant response"""
+        for message in reversed(messages):
+            if message.role == "assistant" and message.content:
+                for content in message.content:
+                    if hasattr(content, 'text') and content.text.value:
+                        return content.text.value
+        return "No response found from assistant"
+
+    def _run(self, query: str) -> str:
+        """Execute the main assistant interaction flow"""
+        try:
+            logger.info(f"Creating new thread for query: {query[:50]}...")
+            thread = self.client.beta.threads.create()
+            
+            logger.debug("Adding user message to thread")
+            self.client.beta.threads.messages.create(
+                thread_id=thread.id,
+                role="user",
+                content=query
+            )
+            
+            logger.info(f"Starting assistant run with ID: {self.assistant_id}")
+            run = self.client.beta.threads.runs.create(
+                thread_id=thread.id,
+                assistant_id=self.assistant_id
+            )
+            
+            logger.debug(f"Started run {run.id}")
+            return self._process_message(thread.id, run.id)
+        
+        except ValidationError as e:
+            logger.error(f"Configuration validation error: {str(e)}")
+            return f"Configuration error: {str(e)}"
+        except Exception as e:
+            logger.error(f"Assistant interaction failed: {str(e)}")
+            return f"Assistant error: {str(e)}"
+----------------------------------
+File: C:\Projects\CrewAI-Studio\app\tools\CSVSearchToolEnhanced.py
+from pydantic import BaseModel, Field, model_validator
+from crewai_tools import RagTool
+from embedchain.models.data_type import DataType
+from typing import Any, Optional, Type
+from embedchain import App
+from crewai_tools.tools.rag.rag_tool import Adapter
+
+class CSVEmbedchainAdapter(Adapter):
+    embedchain_app: App
+    summarize: bool = False
+    src: Optional[str] = None
+
+    def query(self, question: str) -> str:
+        where = (
+            {"app_id": self.embedchain_app.config.id, "url": self.src}
+            if self.src
+            else None
+        )
+        result, sources = self.embedchain_app.query(
+            question, citations=True, dry_run=(not self.summarize), where=where
+        )
+        if self.summarize:
+            return result
+        return "\n\n".join([source[0] for source in sources])
+
+    def add(
+        self,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        self.src = args[0] if args else None
+        self.embedchain_app.add(*args, **kwargs)
+
+class FixedCSVSearchToolSchema(BaseModel):
+    """Input for CSVSearchTool."""
+
+    query: str = Field(
+        ...,
+        description="Mandatory search query you want to use to search the CSV's content",
+    )
+
+class CSVSearchToolSchema(FixedCSVSearchToolSchema):
+    """Input for CSVSearchTool."""
+
+    csv: str = Field(..., description="Mandatory csv path you want to search")
+
+class CSVSearchToolEnhanced(RagTool):
+    name: str = "Search a CSV's content"
+    description: str = (
+        "A tool that can be used to semantic search a query from a CSV's content."
+    )
+    args_schema: Type[BaseModel] = CSVSearchToolSchema
+
+    @model_validator(mode="after")
+    def _set_default_adapter(self):
+        if isinstance(self.adapter, RagTool._AdapterPlaceholder):
+            from embedchain import App
+
+            app = App.from_config(config=self.config) if self.config else App()
+            self.adapter = CSVEmbedchainAdapter(
+                embedchain_app=app, summarize=self.summarize
+            )
+        return self
+
+    def __init__(self, csv: Optional[str] = None, name: Optional[str] = None, description: Optional[str] = None, **kwargs):
+        if csv and description is None:
+            kwargs["description"] = f"A tool that can be used to semantic search a query the {csv} CSV's content."
+        if name:
+            kwargs["name"] = name
+        if description:
+            kwargs["description"] = description
+        if csv:
+            kwargs["data_type"] = DataType.CSV
+            kwargs["args_schema"] = FixedCSVSearchToolSchema
+            super().__init__(**kwargs)
+            self.add(csv)            
+            #self._generate_description()
+        else:
+            super().__init__(**kwargs)
+
+    def add(
+        self,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        super().add(*args, **kwargs)
+
+    def _before_run(
+        self,
+        query: str,
+        **kwargs: Any,
+    ) -> Any:
+        if "csv" in kwargs:
+            self.add(kwargs["csv"])
+
+    def _run(
+        self,
+        **kwargs: Any,
+    ) -> Any:
+        if not "query" in kwargs:
+            return "Please provide a query to search the CSV's content."
+        if not "csv" in kwargs and not self.args_schema == FixedCSVSearchToolSchema:
+            return "Please provide a CSV to search."
+        return super()._run(**kwargs)
+    
+
+    
+
+
+----------------------------------
+File: C:\Projects\CrewAI-Studio\app\tools\CustomApiTool.py
+from typing import Optional, Dict, Any
+from crewai.tools import BaseTool
+import requests
+from pydantic.v1 import BaseModel, Field
+
+
+class CustomApiToolInputSchema(BaseModel):
+    endpoint: str = Field(..., description="The specific endpoint for the API call")
+    method: str = Field(..., description="HTTP method to use (GET, POST, PUT, DELETE)")
+    headers: Optional[Dict[str, str]] = Field(None, description="HTTP headers to include in the request")
+    query_params: Optional[Dict[str, Any]] = Field(None, description="Query parameters for the request")
+    body: Optional[Dict[str, Any]] = Field(None, description="Body of the request for POST/PUT methods")
+
+class CustomApiTool(BaseTool):
+    name: str = "Call Api"
+    description: str = "Tool to make API calls with customizable parameters"
+    args_schema = CustomApiToolInputSchema
+    base_url: Optional[str] = None
+    default_headers: Optional[Dict[str, str]] = None
+    default_query_params: Optional[Dict[str, Any]] = None
+
+    def __init__(self, base_url: Optional[str] = None, headers: Optional[Dict[str, str]] = None, query_params: Optional[Dict[str, Any]] = None, **kwargs):
+        super().__init__(**kwargs)
+        self.base_url = base_url
+        self.default_headers = headers or {}
+        self.default_query_params = query_params or {}
+        self._generate_description()
+        
+
+    def _run(self, endpoint: str, method: str, headers: Optional[Dict[str, str]] = None, query_params: Optional[Dict[str, Any]] = None, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        url = f"{self.base_url}/{endpoint}".rstrip("/")
+        headers = {**self.default_headers, **(headers or {})}
+        query_params = {**self.default_query_params, **(query_params or {})}
+
+        try:
+            response = requests.request(
+                method=method.upper(),
+                url=url,
+                headers=headers,
+                params=query_params,
+                json=body,
+                verify=False #TODO: add option to disable SSL verification
+            )
+            return {
+                "status_code": response.status_code,
+                "response": response.json() if response.headers.get("Content-Type") == "application/json" else response.text
+            }
+        except Exception as e:
+            return {
+                "status_code": 500,
+                "response": str(e)
+            }
+
+    def run(self, input_data: CustomApiToolInputSchema) -> Any:
+        response_data = self._run(
+            endpoint=input_data.endpoint,
+            method=input_data.method,
+            headers=input_data.headers,
+            query_params=input_data.query_params,
+            body=input_data.body
+            
+        )
+        return response_data
+
+----------------------------------
+File: C:\Projects\CrewAI-Studio\app\tools\CustomCodeInterpreterTool.py
+import os
+from typing import Optional, Type
+from crewai.tools import BaseTool
+import importlib.util
+#from pydantic.v1 import BaseModel, Field,root_validator
+from pydantic import BaseModel, Field
+import docker
+import base64
+
+class CustomCodeInterpreterSchema(BaseModel):
+    """Input for CustomCodeInterpreterTool."""
+    code: Optional[str] = Field(
+        None,
+        description="Python3 code used to be interpreted in the Docker container. ALWAYS PRINT the final result and the output of the code",
+    )
+
+    run_script: Optional[str] = Field(
+        None,
+        description="Relative path to the script to run in the Docker container. The script should contain the code to be executed.",
+    )
+
+    libraries_used: str = Field(
+        ...,
+        description="List of libraries used in the code with proper installing names separated by commas. Example: numpy,pandas,beautifulsoup4",
+    )
+
+    def check_code_or_run_script(cls, values):
+        code = values.get('code')
+        run_script = values.get('run_script')
+        if not code and not run_script:
+            raise ValueError('Either code or run_script must be provided')
+        if code and run_script:
+            raise ValueError('Only one of code or run_script should be provided')
+        return values
+
+class CustomCodeInterpreterTool(BaseTool):
+    name: str = "Code Interpreter"
+    description: str = "Interprets Python3 code strings with a final print statement. Requires eighter code or run_script to be provided."
+    args_schema: Type[BaseModel] = CustomCodeInterpreterSchema
+    code: Optional[str] = None
+    run_script: Optional[str] = None
+    workspace_dir: Optional[str] = None
+
+    def __init__(self, workspace_dir: Optional[str] = None, **kwargs):
+        super().__init__(**kwargs)
+        if workspace_dir is not None and len(workspace_dir) > 0:
+            self.workspace_dir = os.path.abspath(workspace_dir)
+            os.makedirs(self.workspace_dir, exist_ok=True)
+        self._generate_description()
+
+    @staticmethod
+    def _get_installed_package_path():
+        spec = importlib.util.find_spec('crewai_tools')
+        return os.path.dirname(spec.origin)
+
+    def _verify_docker_image(self) -> None:
+        """
+        Verify if the Docker image is available
+        """
+        image_tag = "code-interpreter:latest"
+        client = docker.from_env()
+
+        try:
+            client.images.get(image_tag)
+
+        except docker.errors.ImageNotFound:
+            package_path = self._get_installed_package_path()
+            dockerfile_path = os.path.join(package_path, "tools/code_interpreter_tool")
+            if not os.path.exists(dockerfile_path):
+                raise FileNotFoundError(f"Dockerfile not found in {dockerfile_path}")
+
+            client.images.build(
+                path=dockerfile_path,
+                tag=image_tag,
+                rm=True,
+            )
+
+    def _install_libraries(
+        self, container: docker.models.containers.Container, libraries: str
+    ) -> None:
+        """
+        Install missing libraries in the Docker container
+        """
+        if libraries and len(libraries) > 0:
+            for library in libraries.split(","):
+                print(f"Installing library: {library}")
+                install_result = container.exec_run(f"pip install {library}")
+                if install_result.exit_code != 0:
+                    print(f"Something went wrong while installing the library: {library}")
+                    print(install_result.output.decode("utf-8"))
+            
+
+    def _get_existing_container(self, container_name: str) -> Optional[docker.models.containers.Container]:
+        client = docker.from_env()
+        try:
+            existing_container = client.containers.get(container_name)
+            if existing_container.status == 'running':
+                return existing_container
+            if existing_container.status == 'exited':
+                existing_container.remove()
+        except docker.errors.NotFound:
+            pass
+        return None
+
+    def _init_docker_container(self) -> docker.models.containers.Container:
+        client = docker.from_env()
+        volumes = {}
+        if self.workspace_dir:
+            volumes[self.workspace_dir] = {"bind": "/workspace", "mode": "rw"}
+        container_name = "custom-code-interpreter"
+        existing_container = self._get_existing_container(container_name)
+        if existing_container:
+            return existing_container
+        return client.containers.run(
+            "code-interpreter", detach=True, tty=True, working_dir="/workspace", name=container_name, volumes=volumes
+        )
+
+    def run_code_in_docker(self, code: str, libraries_used: str) -> str:
+        self._verify_docker_image()
+        container = self._init_docker_container()
+        self._install_libraries(container, libraries_used)
+        
+        # Encode the code to base64
+        encoded_code = base64.b64encode(code.encode('utf-8')).decode('utf-8')
+        
+        # Create a command to decode the base64 string and run the Python code
+        cmd_to_run = f'python3 -c "import base64; exec(base64.b64decode(\'{encoded_code}\').decode(\'utf-8\'))"'
+        
+        print(f"Running code in container: \n{code}")
+        
+        exec_result = container.exec_run(cmd_to_run)
+
+        if exec_result.exit_code != 0:
+            print(f"Something went wrong while running the code: \n{exec_result.output.decode('utf-8')}")
+            return f"Something went wrong while running the code: \n{exec_result.output.decode('utf-8')}"
+        print(f"Code run output: \n{exec_result.output.decode('utf-8')}")
+        return exec_result.output.decode("utf-8")
+    
+    def _run_script(self, run_script: str,libraries_used: str) -> str:
+        with open(f"{self.workspace_dir}/{run_script}", "r") as file:
+            code = file.read()
+            return self.run_code_in_docker(code, libraries_used)
+
+    def _run(self, **kwargs) -> str:
+        code = kwargs.get("code", self.code)
+        run_script = kwargs.get("run_script", self.run_script)
+        libraries_used = kwargs.get("libraries_used", [])
+        if run_script:
+            return self._run_script(run_script, libraries_used)
+        return self.run_code_in_docker(code, libraries_used)
+
+----------------------------------
+File: C:\Projects\CrewAI-Studio\app\tools\CustomFileWriteTool.py
+import os
+from typing import Optional, Dict, Any
+from crewai.tools import BaseTool
+from pydantic import BaseModel, Field, model_validator
+
+class FixedCustomFileWriteToolInputSchema(BaseModel):
+    content: str = Field(..., description="The content to write or append to the file")
+    mode: str = Field(..., description="Mode to open the file in, either 'w' or 'a'")
+
+class CustomFileWriteToolInputSchema(FixedCustomFileWriteToolInputSchema):
+    content: str = Field(..., description="The content to write or append to the file")
+    mode: str = Field(..., description="Mode to open the file in, either 'w' or 'a'")
+    filename: str = Field(..., description="The name of the file to write to or append")
+
+class CustomFileWriteTool(BaseTool):
+    name: str = "Write File"
+    description: str = "Tool to write or append to files"
+    args_schema = CustomFileWriteToolInputSchema
+    filename: Optional[str] = None
+
+    def __init__(self, base_folder: str, filename: Optional[str] = None, **kwargs):
+        super().__init__(**kwargs)
+        if filename is not None and len(filename) > 0:
+            self.args_schema = FixedCustomFileWriteToolInputSchema
+        self._base_folder = base_folder
+        self.filename = filename or None
+        self._ensure_base_folder_exists()
+        self._generate_description()
+
+
+    def _ensure_base_folder_exists(self):
+        os.makedirs(self._base_folder, exist_ok=True)
+
+    def _get_full_path(self, filename: Optional[str]) -> str:
+        if filename is None and self.filename is None:
+            raise ValueError("No filename specified and no default file set.")
+
+        chosen_file = filename or self.filename
+        full_path = os.path.abspath(os.path.join(self._base_folder, chosen_file))
+
+        if not full_path.startswith(os.path.abspath(self._base_folder)):
+            raise ValueError("Access outside the base directory is not allowed.")  #TODO: add validations for path traversal
+
+        return full_path
+
+    def _run(self, content: str, mode: str, filename: Optional[str] = None) -> Dict[str, Any]:
+        full_path = self._get_full_path(filename)
+        try:
+            with open(full_path, 'a' if mode == 'a' else 'w') as file:
+                file.write(content)
+            return {
+                "status": "success",
+                "message": f"Content successfully {'appended to' if mode == 'a' else 'written to'} {full_path}"
+            }
+        except Exception as e:
+            return {
+                "status": "error",
+                "message": str(e)
+            }
+
+    def run(self, input_data: CustomFileWriteToolInputSchema) -> Any:
+        response_data = self._run(
+            content=input_data.content,
+            mode=input_data.mode,
+            filename=input_data.filename
+        )
+        return response_data
+
+----------------------------------
+File: C:\Projects\CrewAI-Studio\app\tools\ScrapeWebsiteToolEnhanced.py
+from urllib.parse import urljoin
+import re
+from typing import Any, Optional, Type
+from datetime import datetime
+import requests
+from bs4 import BeautifulSoup, Tag
+from pydantic import BaseModel, Field
+from crewai.tools import BaseTool
+
+
+class FixedScrapeWebsiteToolEnhancedSchema(BaseModel):
+    """Fixed input schema - when website_url is provided in constructor."""
+    pass
+
+
+class ScrapeWebsiteToolEnhancedSchema(FixedScrapeWebsiteToolEnhancedSchema):
+    """Dynamic input schema - what the agent sees and can set."""
+    website_url: str = Field(..., description="Mandatory website URL to read the file")
+
+
+class ScrapeWebsiteToolEnhanced(BaseTool):
+    name: str = "Read website content"
+    description: str = "A tool that can be used to read website content."
+    args_schema: Type[BaseModel] = ScrapeWebsiteToolEnhancedSchema
+
+    website_url: Optional[str] = None
+    cookies: Optional[dict] = None
+    show_urls: Optional[bool] = False
+    css_selector: Optional[str] = None
+        
+    headers: Optional[dict] = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.110 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.google.com/",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+    }
+
+    def __init__(
+        self,
+        website_url: Optional[str] = None,
+        cookies: Optional[dict] = None,
+        show_urls: Optional[bool] = False,
+        css_selector: Optional[str] = None,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+
+        self.website_url = website_url
+        self.cookies = cookies
+        self.show_urls = show_urls
+        self.css_selector = css_selector
+
+        if website_url is not None and "description" not in kwargs:
+            self.description = (
+                f"A tool that can be used to read {website_url}'s content."
+            )
+            self.args_schema = FixedScrapeWebsiteToolEnhancedSchema
+            self._generate_description()
+        
+    def clean_text(self, text: str) -> str:
+        """Clean and normalize text content."""
+        if not text:
+            return ""
+
+        # Remove HTML tags while preserving line breaks
+        text = text.replace('<br>', '\n').replace('<br/>', '\n').replace('<br />', '\n')
+        text = text.replace('<hr/>', '').replace('<hr />', '').replace('<hr>', '')
+        
+        # Remove all remaining HTML tags
+        text = re.sub(r'<[^>]+>', '', text)
+        
+        # Convert various whitespace to spaces
+        text = re.sub(r'[\t\f\r\x0b]', ' ', text)
+        
+        # Clean up spaces and empty lines
+        text = re.sub(r' {2,}', ' ', text)
+        text = text.strip()
+        text = re.sub(r'^\s+', '', text, flags=re.MULTILINE)
+        
+        # Remove wicket attributes and other technical artifacts
+        text = re.sub(r'wicket:[^\s>]+', '', text)
+        text = re.sub(r'\s*style="[^"]*"', '', text)
+        text = re.sub(r'\s*class="[^"]*"', '', text)
+        text = re.sub(r'<!--.*?-->', '', text, flags=re.DOTALL)
+        
+        # Remove empty lines while preserving intentional line breaks
+        text = re.sub(r'\n\s*\n', '\n\n', text)
+        
+        return text.strip()
+
+    def extract_text_with_structure(self, element: Tag, depth: int = 0) -> list:
+        """Extract text while preserving structure."""
+        results = []
+        
+        # Skip script and style
+        if element.name in ['script', 'style']:
+            return results
+
+        # Handle direct text content
+        if isinstance(element, str):
+            text = self.clean_text(element)
+            if text:
+                results.append(("    " * depth) + text)
+            return results
+
+        # Handle link elements
+        if element.name == 'a' and element.get('href'):
+            href = element['href']
+            if not href.startswith('javascript:'):
+                text = self.clean_text(element.get_text())
+                if text:
+                    if self.show_urls:
+                        full_url = urljoin(self.website_url, href)
+                        results.append(("    " * depth) + f"<{text}: {full_url}>")
+                    else:
+                        results.append(("    " * depth) + text)
+            return results
+
+        # For tables, preserve structure
+        if element.name == 'table':
+            rows = []
+            # Process headers
+            header_row = element.find(['tr', 'thead'])
+            headers = []
+            if header_row:
+                for th in header_row.find_all(['th', 'td']):
+                    header_results = self.extract_text_with_structure(th, 0)
+                    if header_results:
+                        headers.append(" ".join(line.strip() for line in header_results))
+            if headers:
+                results.append(("    " * depth) + " | ".join(headers))
+                results.append(("    " * depth) + ("-" * len(" | ".join(headers))))
+
+            # Process data rows
+            for tr in element.find_all('tr'):
+                if tr != header_row:
+                    cols = []
+                    for td in tr.find_all(['td', 'th']):
+                        cell_results = self.extract_text_with_structure(td, 0)
+                        if cell_results:
+                            cols.append(" ".join(line.strip() for line in cell_results))
+                    if cols:
+                        results.append(("    " * depth) + " | ".join(cols))
+            return results
+
+        # For lists, preserve bullets/numbers
+        if element.name in ['ul', 'ol']:
+            for i, li in enumerate(element.find_all('li', recursive=False), 1):
+                prefix = f"{i}. " if element.name == 'ol' else "• "
+                li_results = self.extract_text_with_structure(li, depth)
+                if li_results:
+                    first_line = True
+                    for line in li_results:
+                        if first_line:
+                            results.append(("    " * depth) + prefix + line.lstrip())
+                            first_line = False
+                        else:
+                            results.append(("    " * (depth + 1)) + line.lstrip())
+            return results
+
+        # For headings, add markdown style
+        if element.name in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
+            text = self.clean_text(element.get_text())
+            if text:
+                level = min(int(element.name[1]), 6)
+                results.append('')
+                results.append(("    " * depth) + '#' * level + ' ' + text)
+                results.append('')
+            return results
+
+        # Process all child elements and maintain structure
+        for child in element.children:
+            # Skip empty text nodes
+            if isinstance(child, str) and not child.strip():
+                continue
+                
+            child_results = self.extract_text_with_structure(child, depth)
+            if not child_results:
+                continue
+
+            # Add proper spacing for block elements
+            if isinstance(child, Tag) and child.name in ['div', 'p', 'section', 'article', 'header', 'footer']:
+                if results and results[-1]:
+                    results.append('')
+                results.extend(child_results)
+                if child_results[-1]:
+                    results.append('')
+            else:
+                results.extend(child_results)
+
+        return results
+
+    def extract_metadata(self, soup: BeautifulSoup, url: str) -> str:
+        """Extract and format page metadata."""
+        metadata = [
+            "### Page Metadata ###",
+            f"URL: {url}",
+            f"Scraping Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        ]
+        
+        # Extract title
+        title = soup.find('title')
+        if title and title.string and title.string.strip():
+            metadata.append(f"Title: {title.string.strip()}")
+            
+        # Extract description
+        meta_desc = soup.find('meta', {'name': 'description'}) or soup.find('meta', {'property': 'og:description'})
+        if meta_desc and meta_desc.get('content') and meta_desc['content'].strip():
+            metadata.append(f"Description: {meta_desc['content'].strip()}")
+            
+        # Extract language
+        html_tag = soup.find('html')
+        if html_tag and html_tag.get('lang') and html_tag['lang'].strip():
+            metadata.append(f"Language: {html_tag['lang']}")
+            
+        metadata.append("---")
+        return "\n".join(metadata)
+
+    def extract_pdf_metadata(self, url: str, response: requests.Response) -> str:
+        """Extract and format metadata for a PDF file, including filename from response headers."""
+        # Try to extract filename from Content-Disposition header
+        content_disposition = response.headers.get("Content-Disposition", "")
+        filename = "unknown"
+
+        if "filename=" in content_disposition:
+            # Extract filename from Content-Disposition
+            filename_match = re.search(r'filename\*?="?([^;"]+)"?', content_disposition)
+            if filename_match:
+                filename = filename_match.group(1).strip()
+        
+        if filename == "unknown":
+            filename = url.split("/")[-1].split("?")[0] or "unknown"
+
+        metadata = [
+            "### PDF Metadata ###",
+            f"URL: {url}",
+            f"Filename: {filename}",
+            f"Scraping Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        ]
+        return "\n".join(metadata)
+    
+    def pdf_url_to_text(self, url: str) -> str:
+        from pdfminer.high_level import extract_text
+        from io import BytesIO
+
+        """
+        Stáhne PDF soubor z URL a převede jeho obsah na text.
+
+        Args:
+            url (str): URL adresa PDF souboru.
+
+        Returns:
+            str: Text převedený z PDF.
+        """
+        try:
+            response = requests.get(url, headers=self.headers, timeout=15)
+            response.raise_for_status()
+            pdf_file = BytesIO(response.content)
+
+            text = extract_text(pdf_file)
+            return text
+        except Exception as e:
+            return f"Error processing PDF: {e}"
+        
+    def _run(
+        self,
+        **kwargs: Any,
+    ) -> Any:
+        website_url = kwargs.get("website_url", self.website_url)
+        if not website_url:
+            return "Error: No website URL provided"
+            
+        self.website_url = website_url
+        css_selector = self.css_selector
+        
+        try:
+            response = requests.get(
+                website_url,
+                timeout=15,
+                headers=self.headers,
+                cookies=self.cookies if self.cookies else {},
+                allow_redirects=True
+            )
+            
+            # Store original URL if redirected
+            final_url = response.url
+            was_redirected = len(response.history) > 0
+            original_url = response.history[0].url if was_redirected else website_url
+            
+            # Create initial metadata
+            metadata = [
+                "### Page Metadata ###",
+                f"URL: {original_url}",
+                f"Status: {response.status_code}",
+                f"Scraping Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            ]
+            if was_redirected:
+                metadata.append(f"Redirect: {original_url} -> {final_url}")
+            
+            # Handle binary content
+            content_type = response.headers.get("Content-Type", "").lower()
+            if "pdf" in content_type:
+                metadata = self.extract_pdf_metadata(final_url, response)
+                text = self.pdf_url_to_text(final_url)
+                return metadata + "\n\n### PDF Content ###\n" + text
+
+            if any(binary_type in content_type for binary_type in ["image", "octet-stream"]):
+                filename = website_url.split("/")[-1] or "unknown"
+                metadata.append("---\n")
+                return "\n".join(metadata) + f"Binary file detected: {filename}"
+
+            try:
+                response.encoding = response.apparent_encoding or 'utf-8'
+                parsed = BeautifulSoup(response.text, "html.parser")
+            except Exception as e:
+                metadata.append("---\n")
+                return "\n".join(metadata) + f"\nError: Failed to parse HTML content: {str(e)}"
+
+            metadata = self.extract_metadata(parsed, final_url)
+
+            # Remove script and style elements
+            for tag in parsed(['script', 'style']):
+                tag.extract()
+
+            # Process content based on CSS selector or whole document
+            elements_to_process = []
+            if css_selector:
+                elements_to_process = parsed.select(css_selector)
+            else:
+                # Process everything in the body, or fall back to whole document
+                body = parsed.find('body')
+                if body:
+                    elements_to_process = [body]
+                else:
+                    elements_to_process = [parsed]
+
+            # Extract text from selected elements
+            results = []
+            for element in elements_to_process:
+                results.extend(self.extract_text_with_structure(element))
+
+            # Join results and clean up
+            text = '\n'.join(line for line in results if line is not None)
+            text = re.sub(r'\n{3,}', '\n\n', text)  # Normalize multiple newlines
+            text = text.strip()
+
+            return metadata + "\n" + text if text else metadata + "No meaningful content found on the page."
+            
+        except requests.Timeout:
+            return "Error: Website request timed out"
+        except requests.RequestException as e:
+            return f"Error: Failed to fetch website content: {str(e)}"
+----------------------------------
+File: C:\Projects\CrewAI-Studio\app\app.py
+import streamlit as st
+from streamlit import session_state as ss
+import db_utils
+from pg_agents import PageAgents
+from pg_tasks import PageTasks
+from pg_crews import PageCrews
+from pg_tools import PageTools
+from pg_crew_run import PageCrewRun
+from pg_export_crew import PageExportCrew
+from pg_results import PageResults
+from pg_knowledge import PageKnowledge
+from dotenv import load_dotenv
+from llms import load_secrets_fron_env
+import os
+
+def pages():
+    return {
+        'Crews': PageCrews(),
+        'Tools': PageTools(),
+        'Agents': PageAgents(),
+        'Tasks': PageTasks(),
+        'Knowledge': PageKnowledge(),  # Add this line
+        'Kickoff!': PageCrewRun(),
+        'Results': PageResults(),
+        'Import/export': PageExportCrew()
+    }
+
+def load_data():
+    ss.agents = db_utils.load_agents()
+    ss.tasks = db_utils.load_tasks()
+    ss.crews = db_utils.load_crews()
+    ss.tools = db_utils.load_tools()
+    ss.enabled_tools = db_utils.load_tools_state()
+    ss.knowledge_sources = db_utils.load_knowledge_sources()
+
+
+def draw_sidebar():
+    with st.sidebar:
+        st.image("img/crewai_logo.png")
+
+        if 'page' not in ss:
+            ss.page = 'Crews'
+        
+        selected_page = st.radio('Page', list(pages().keys()), index=list(pages().keys()).index(ss.page),label_visibility="collapsed")
+        if selected_page != ss.page:
+            ss.page = selected_page
+            st.rerun()
+            
+def main():
+    st.set_page_config(page_title="CrewAI Studio", page_icon="img/favicon.ico", layout="wide")
+    load_dotenv()
+    load_secrets_fron_env()
+    if (str(os.getenv('AGENTOPS_ENABLED')).lower() in ['true', '1']) and not ss.get('agentops_failed', False):
+        try:
+            import agentops
+            agentops.init(api_key=os.getenv('AGENTOPS_API_KEY'),auto_start_session=False)    
+        except ModuleNotFoundError as e:
+            ss.agentops_failed = True
+            print(f"Error initializing AgentOps: {str(e)}")            
+        
+    db_utils.initialize_db()
+    load_data()
+    draw_sidebar()
+    PageCrewRun.maintain_session_state() #this will persist the session state for the crew run page so crew run can be run in a separate thread
+    pages()[ss.page].draw()
+    
+if __name__ == '__main__':
+    main()
+
+----------------------------------
+File: C:\Projects\CrewAI-Studio\app\console_capture.py
+import sys
+import threading
+from queue import Queue
+import re
+
+class ConsoleCapture:
+    def __init__(self):
+        self.output_queue = Queue()
+        self.original_stdout = sys.stdout
+        self.original_stderr = sys.stderr
+        self._lock = threading.Lock()
+        self._line_buffer = ""
+        self.active = False
+        # Pattern pro veškeré ANSI a speciální znaky
+        self.clean_pattern = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-9;]*[ -/]*[@-~])|[\x00-\x1F\x7F-\x9F]')
+
+    def clean_text(self, text):
+        """Odstraní všechny ANSI a kontrolní znaky"""
+        return self.clean_pattern.sub('', text)
+        #return text
+
+    def start(self):
+        with self._lock:
+            sys.stdout = self
+            sys.stderr = self
+            self.active = True
+
+    def stop(self):
+        with self._lock:
+            if self.active:
+                sys.stdout = self.original_stdout
+                sys.stderr = self.original_stderr
+                if self._line_buffer:
+                    cleaned_text = self.clean_text(self._line_buffer)
+                    if cleaned_text:
+                        self.output_queue.put(cleaned_text)
+                    self._line_buffer = ""
+                self.active = False
+
+    def write(self, text):
+        with self._lock:
+            if self.active:
+                self.original_stdout.write(text)
+                self._line_buffer += text
+                
+                while '\n' in self._line_buffer:
+                    line, self._line_buffer = self._line_buffer.split('\n', 1)
+                    if line:
+                        cleaned_line = self.clean_text(line)
+                        if cleaned_line:
+                            self.output_queue.put(cleaned_line)
+                
+                self.original_stdout.flush()
+
+    def flush(self):
+        with self._lock:
+            if self.active:
+                self.original_stdout.flush()
+
+    def get_output(self):
+        messages = []
+        with self._lock:
+            while not self.output_queue.empty():
+                messages.append(self.output_queue.get_nowait())
+        return messages
+----------------------------------
+File: C:\Projects\CrewAI-Studio\app\db_utils.py
+import sqlite3
+import os
+import json
+from my_tools import TOOL_CLASSES
+from sqlalchemy import create_engine, text
+
+# If you have an environment variable DB_URL for Postgres, use that. 
+# Otherwise, fallback to local SQLite file: 'sqlite:///crewai.db'
+DEFAULT_SQLITE_URL = 'sqlite:///crewai.db'
+DB_URL = os.getenv('DB_URL', DEFAULT_SQLITE_URL)
+
+# Create a SQLAlchemy Engine.
+# For example, DB_URL could be:
+#   "postgresql://username:password@hostname:5432/dbname"
+# or fallback to: "sqlite:///crewai.db"
+engine = create_engine(DB_URL, echo=False)
+
+def get_db_connection():
+    # conn = sqlite3.connect(DB_NAME)
+    # conn.row_factory = sqlite3.Row
+    # return conn
+    """
+    Return a context-managed connection from the SQLAlchemy engine.
+    """
+    return engine.connect()
+
+def create_tables():
+    create_sql = text('''
+        CREATE TABLE IF NOT EXISTS entities (
+            id TEXT PRIMARY KEY,
+            entity_type TEXT,
+            data TEXT
+        )
+    ''')
+    with get_db_connection() as conn:
+        conn.execute(create_sql)
+        conn.commit()
+
+def initialize_db():
+    """
+    Initialize the database by creating tables if they do not exist.
+    """
+    create_tables()
+
+
+def save_entity(entity_type, entity_id, data):
+    # For SQLite ≥ 3.24 and for Postgres, we can do:
+    #   INSERT ... ON CONFLICT(id) DO UPDATE ...
+    # to emulate "INSERT OR REPLACE"
+    upsert_sql = text('''
+        INSERT INTO entities (id, entity_type, data)
+        VALUES (:id, :etype, :data)
+        ON CONFLICT(id) DO UPDATE
+            SET entity_type = EXCLUDED.entity_type,
+                data = EXCLUDED.data
+    ''')
+    with get_db_connection() as conn:
+        conn.execute(
+            upsert_sql,
+            {
+                "id": entity_id,
+                "etype": entity_type,
+                "data": json.dumps(data),
+            }
+        )
+        conn.commit()
+
+def load_entities(entity_type):
+    query = text('SELECT id, data FROM entities WHERE entity_type = :etype')
+    with get_db_connection() as conn:
+        result = conn.execute(query, {"etype": entity_type})
+        # result.mappings() gives us rows as dicts (if using SQLAlchemy 1.4+)
+        rows = result.mappings().all()
+    return [(row["id"], json.loads(row["data"])) for row in rows]
+
+def delete_entity(entity_type, entity_id):
+    delete_sql = text('''
+        DELETE FROM entities
+        WHERE id = :id AND entity_type = :etype
+    ''')
+    with get_db_connection() as conn:
+        conn.execute(delete_sql, {"id": entity_id, "etype": entity_type})
+        conn.commit()
+
+def save_tools_state(enabled_tools):
+    data = {
+        'enabled_tools': enabled_tools
+    }
+    save_entity('tools_state', 'enabled_tools', data)
+
+def load_tools_state():
+    rows = load_entities('tools_state')
+    if rows:
+        return rows[0][1].get('enabled_tools', {})
+    return {}
+
+def save_knowledge_source(knowledge_source):
+    data = {
+        'name': knowledge_source.name,
+        'source_type': knowledge_source.source_type,
+        'source_path': knowledge_source.source_path,
+        'content': knowledge_source.content,
+        'metadata': knowledge_source.metadata,
+        'chunk_size': knowledge_source.chunk_size,
+        'chunk_overlap': knowledge_source.chunk_overlap,
+        'created_at': knowledge_source.created_at
+    }
+    save_entity('knowledge_source', knowledge_source.id, data)
+
+def load_knowledge_sources():
+    from my_knowledge_source import MyKnowledgeSource
+    rows = load_entities('knowledge_source')
+    knowledge_sources = []
+    for row in rows:
+        data = row[1]
+        knowledge_source = MyKnowledgeSource(id=row[0], **data)
+        knowledge_sources.append(knowledge_source)
+    return sorted(knowledge_sources, key=lambda x: x.created_at)
+
+def delete_knowledge_source(knowledge_source_id):
+    delete_entity('knowledge_source', knowledge_source_id)
+
+def save_agent(agent):
+    data = {
+        'created_at': agent.created_at,
+        'role': agent.role,
+        'backstory': agent.backstory,
+        'goal': agent.goal,
+        'allow_delegation': agent.allow_delegation,
+        'verbose': agent.verbose,
+        'cache': agent.cache,
+        'llm_provider_model': agent.llm_provider_model,
+        'temperature': agent.temperature,
+        'max_iter': agent.max_iter,
+        'tool_ids': [tool.tool_id for tool in agent.tools],
+        'knowledge_source_ids': agent.knowledge_source_ids
+    }
+    save_entity('agent', agent.id, data)
+
+def load_agents():
+    from my_agent import MyAgent
+    rows = load_entities('agent')
+    tools_dict = {tool.tool_id: tool for tool in load_tools()}
+    agents = []
+    for row in rows:
+        data = row[1]
+        tool_ids = data.pop('tool_ids', [])
+        knowledge_source_ids = data.pop('knowledge_source_ids', [])
+        agent = MyAgent(id=row[0], knowledge_source_ids=knowledge_source_ids, **data)
+        agent.tools = [tools_dict[tool_id] for tool_id in tool_ids if tool_id in tools_dict]
+        agents.append(agent)
+    return sorted(agents, key=lambda x: x.created_at)
+
+
+def delete_agent(agent_id):
+    delete_entity('agent', agent_id)
+
+def save_task(task):
+    data = {
+        'description': task.description,
+        'expected_output': task.expected_output,
+        'async_execution': task.async_execution,
+        'agent_id': task.agent.id if task.agent else None,
+        'context_from_async_tasks_ids': task.context_from_async_tasks_ids,
+        'context_from_sync_tasks_ids': task.context_from_sync_tasks_ids,
+        'created_at': task.created_at
+    }
+    save_entity('task', task.id, data)
+
+def load_tasks():
+    from my_task import MyTask
+    rows = load_entities('task')
+    agents_dict = {agent.id: agent for agent in load_agents()}
+    tasks = []
+    for row in rows:
+        data = row[1]
+        agent_id = data.pop('agent_id', None)
+        task = MyTask(id=row[0], agent=agents_dict.get(agent_id), **data)
+        tasks.append(task)
+    return sorted(tasks, key=lambda x: x.created_at)
+
+def delete_task(task_id):
+    delete_entity('task', task_id)
+
+def save_crew(crew):
+    data = {
+        'name': crew.name,
+        'process': crew.process,
+        'verbose': crew.verbose,
+        'agent_ids': [agent.id for agent in crew.agents],
+        'task_ids': [task.id for task in crew.tasks],
+        'memory': crew.memory,
+        'cache': crew.cache,
+        'planning': crew.planning,
+        'max_rpm': crew.max_rpm,
+        'manager_llm': crew.manager_llm,
+        'manager_agent_id': crew.manager_agent.id if crew.manager_agent else None,
+        'created_at': crew.created_at,
+        'knowledge_source_ids': crew.knowledge_source_ids  # Add this line
+    }
+    save_entity('crew', crew.id, data)
+
+def load_crews():
+    from my_crew import MyCrew
+    rows = load_entities('crew')
+    agents_dict = {agent.id: agent for agent in load_agents()}
+    tasks_dict = {task.id: task for task in load_tasks()}
+    crews = []
+    for row in rows:
+        data = row[1]
+        crew = MyCrew(
+            id=row[0], 
+            name=data['name'], 
+            process=data['process'], 
+            verbose=data['verbose'], 
+            created_at=data['created_at'], 
+            memory=data.get('memory'),
+            cache=data.get('cache'),
+            planning=data.get('planning'),
+            max_rpm=data.get('max_rpm'), 
+            manager_llm=data.get('manager_llm'),
+            manager_agent=agents_dict.get(data.get('manager_agent_id')),
+            knowledge_source_ids=data.get('knowledge_source_ids', [])  # Add this line
+        )
+        crew.agents = [agents_dict[agent_id] for agent_id in data['agent_ids'] if agent_id in agents_dict]
+        crew.tasks = [tasks_dict[task_id] for task_id in data['task_ids'] if task_id in tasks_dict]
+        crews.append(crew)
+    return sorted(crews, key=lambda x: x.created_at)
+
+def delete_crew(crew_id):
+    delete_entity('crew', crew_id)
+
+def save_tool(tool):
+    data = {
+        'name': tool.name,
+        'description': tool.description,
+        'parameters': tool.get_parameters()
+    }
+    save_entity('tool', tool.tool_id, data)
+
+def load_tools():
+    rows = load_entities('tool')
+    tools = []
+    for row in rows:
+        data = row[1]
+        tool_class = TOOL_CLASSES[data['name']]
+        tool = tool_class(tool_id=row[0])
+        tool.set_parameters(**data['parameters'])
+        tools.append(tool)
+    return tools
+
+def delete_tool(tool_id):
+    delete_entity('tool', tool_id)
+
+def export_to_json(file_path):
+    with get_db_connection() as conn:
+        # Use SQLAlchemy's text() for raw SQL
+        query = text('SELECT * FROM entities')
+        result = conn.execute(query)
+        
+        # Convert to list of dictionaries
+        rows = [
+            {
+                'id': row.id,
+                'entity_type': row.entity_type,
+                'data': json.loads(row.data)
+            }
+            for row in result
+        ]
+
+        # Write to file
+        with open(file_path, 'w') as f:
+            json.dump(rows, f, indent=4)
+
+def import_from_json(file_path):
+    with open(file_path, 'r') as f:
+        data = json.load(f)
+
+    with get_db_connection() as conn:
+        for entity in data:
+            # Use SQLAlchemy's text() for raw SQL with parameters
+            upsert_sql = text('''
+                INSERT INTO entities (id, entity_type, data)
+                VALUES (:id, :etype, :data)
+                ON CONFLICT(id) DO UPDATE
+                    SET entity_type = EXCLUDED.entity_type,
+                        data = EXCLUDED.data
+            ''')
+            
+            conn.execute(
+                upsert_sql,
+                {
+                    "id": entity['id'],
+                    "etype": entity['entity_type'],
+                    "data": json.dumps(entity['data'])
+                }
+            )
+            
+        conn.commit()
+        
+def save_result(result):
+    """Save a result to the database."""
+    data = {
+        'crew_id': result.crew_id,
+        'crew_name': result.crew_name,
+        'inputs': result.inputs,
+        'result': result.result,
+        'created_at': result.created_at
+    }
+    save_entity('result', result.id, data)
+
+def load_results():
+    """Load all results from the database."""
+    from result import Result
+    rows = load_entities('result')
+    results = []
+    for row in rows:
+        data = row[1]
+        result = Result(
+            id=row[0],
+            crew_id=data['crew_id'],
+            crew_name=data['crew_name'],
+            inputs=data['inputs'],
+            result=data['result'],
+            created_at=data['created_at']
+        )
+        results.append(result)
+    return sorted(results, key=lambda x: x.created_at, reverse=True)
+
+def delete_result(result_id):
+    """Delete a result from the database."""
+    delete_entity('result', result_id)
+----------------------------------
+File: C:\Projects\CrewAI-Studio\app\llms.py
+import os
+from dotenv import load_dotenv
+import streamlit as st
+from langchain_openai import ChatOpenAI
+from langchain_groq import ChatGroq
+from langchain_anthropic import ChatAnthropic
+from crewai import LLM
+from langchain_openai.chat_models.base import BaseChatOpenAI
+from litellm import completion
+
+def load_secrets_fron_env():
+    load_dotenv(override=True)
+    if "env_vars" not in st.session_state:
+        st.session_state.env_vars = {
+            "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY"),
+            "OPENAI_API_BASE": os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1/"),
+            "GROQ_API_KEY": os.getenv("GROQ_API_KEY"),
+            "LMSTUDIO_API_BASE": os.getenv("LMSTUDIO_API_BASE"),
+            "ANTHROPIC_API_KEY": os.getenv("ANTHROPIC_API_KEY"),
+            "OLLAMA_HOST": os.getenv("OLLAMA_HOST"),
+            "XAI_API_KEY": os.getenv("XAI_API_KEY"),
+        }
+    else:
+        st.session_state.env_vars = st.session_state.env_vars
+
+def switch_environment(new_env_vars):
+    for key, value in new_env_vars.items():
+        if value is not None:
+            os.environ[key] = value
+            st.session_state.env_vars[key] = value
+
+def restore_environment():
+    for key, value in st.session_state.env_vars.items():
+        if value is not None:
+            os.environ[key] = value
+        elif key in os.environ:
+            del os.environ[key]
+
+def safe_pop_env_var(key):
+    os.environ.pop(key, None)
+
+def create_openai_llm(model, temperature):
+    switch_environment({
+        "OPENAI_API_KEY": st.session_state.env_vars["OPENAI_API_KEY"],
+        "OPENAI_API_BASE": st.session_state.env_vars["OPENAI_API_BASE"],
+    })
+    api_key = os.getenv("OPENAI_API_KEY")
+    api_base = os.getenv("OPENAI_API_BASE")
+
+    if api_key:
+        return LLM(model=model, temperature=temperature, base_url=api_base)
+    else:
+        raise ValueError("OpenAI API key not set in .env file")
+
+def create_anthropic_llm(model, temperature):
+    switch_environment({
+        "ANTHROPIC_API_KEY": st.session_state.env_vars["ANTHROPIC_API_KEY"],
+    })
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+
+    if api_key:
+        return ChatAnthropic(
+            anthropic_api_key=api_key,
+            model_name=model,
+            temperature=temperature,
+            max_tokens=4095,
+        )
+    else:
+        raise ValueError("Anthropic API key not set in .env file")
+
+def create_groq_llm(model, temperature):
+    switch_environment({
+        "GROQ_API_KEY": st.session_state.env_vars["GROQ_API_KEY"],
+    })
+    api_key = os.getenv("GROQ_API_KEY")
+
+    if api_key:
+        return ChatGroq(groq_api_key=api_key, model_name=model, temperature=temperature, max_tokens=4095)
+    else:
+        raise ValueError("Groq API key not set in .env file")
+
+def create_ollama_llm(model, temperature):
+    host = st.session_state.env_vars["OLLAMA_HOST"]
+    if host:
+        switch_environment({
+            "OPENAI_API_KEY": "ollama",  # Nastaví OpenAI API klíč na "ollama"
+            "OPENAI_API_BASE": host,    # Nastaví OpenAI API Base na hodnotu OLLAMA_HOST
+        })
+        return LLM(model=model, temperature=temperature, base_url=host)
+    else:
+        raise ValueError("Ollama Host is not set in .env file")
+
+
+def create_xai_llm(model, temperature):
+    host = "https://api.x.ai/v1"
+    api_key = st.session_state.env_vars.get("XAI_API_KEY")
+
+    if not api_key:
+        raise ValueError("XAI_API_KEY must be set in .env file")
+
+    switch_environment({
+        "OPENAI_API_KEY": api_key,
+        "OPENAI_API_BASE": host,
+    })
+
+    return LLM(
+        model=model,
+        temperature=temperature,
+        api_key=api_key,
+        base_url=host
+    )
+
+def create_lmstudio_llm(model, temperature):
+    switch_environment({
+        "OPENAI_API_KEY": "lm-studio",
+        "OPENAI_API_BASE": st.session_state.env_vars["LMSTUDIO_API_BASE"],
+    })
+    api_base = os.getenv("OPENAI_API_BASE")
+
+    if api_base:
+        return ChatOpenAI(
+            openai_api_key="lm-studio",
+            openai_api_base=api_base,
+            temperature=temperature,
+            max_tokens=4095,
+        )
+    else:
+        raise ValueError("LM Studio API base not set in .env file")
+
+LLM_CONFIG = {
+    "OpenAI": {
+        "models": os.getenv("OPENAI_PROXY_MODELS", "").split(",") if os.getenv("OPENAI_PROXY_MODELS") else ["gpt-4o", "gpt-4o-mini", "gpt-3.5-turbo", "gpt-4-turbo"],
+        "create_llm": create_openai_llm,
+    },
+    "Groq": {
+        "models": ["groq/llama3-8b-8192", "groq/llama3-70b-8192", "groq/mixtral-8x7b-32768"],
+        "create_llm": create_groq_llm,
+    },
+    "Ollama": {
+        "models": os.getenv("OLLAMA_MODELS", "").split(",") if os.getenv("OLLAMA_MODELS") else [],
+        "create_llm": create_ollama_llm,
+    },
+    "Anthropic": {
+        "models": ["claude-3-5-sonnet-20240620","claude-3-7-sonnet-20250219"],
+        "create_llm": create_anthropic_llm,
+    },
+    "LM Studio": {
+        "models": ["lms-default"],
+        "create_llm": create_lmstudio_llm,
+    },
+     "Xai": {
+        "models": ["xai/grok-2-1212", "xai/grok-beta"],
+        "create_llm": create_xai_llm,
+    },
+}
+
+def llm_providers_and_models():
+    return [f"{provider}: {model}" for provider in LLM_CONFIG.keys() for model in LLM_CONFIG[provider]["models"]]
+
+def create_llm(provider_and_model, temperature=0.15):
+    provider, model = provider_and_model.split(": ")
+    create_llm_func = LLM_CONFIG.get(provider, {}).get("create_llm")
+
+    if create_llm_func:
+        llm = create_llm_func(model, temperature)
+        restore_environment()  # Obnoví původní prostředí po vytvoření LLM
+        return llm
+    else:
+        raise ValueError(f"LLM provider {provider} is not recognized or not supported")
+
+----------------------------------
+File: C:\Projects\CrewAI-Studio\app\my_agent.py
+from crewai import Agent
+import streamlit as st
+from utils import rnd_id, fix_columns_width
+from streamlit import session_state as ss
+from db_utils import save_agent, delete_agent
+from llms import llm_providers_and_models, create_llm
+from datetime import datetime
+
+class MyAgent:
+    def __init__(self, id=None, role=None, backstory=None, goal=None, temperature=None, allow_delegation=False, verbose=False, cache= None, llm_provider_model=None, max_iter=None, created_at=None, tools=None, knowledge_source_ids=None):
+        self.id = id or "A_" + rnd_id()
+        self.role = role or "Senior Researcher"
+        self.backstory = backstory or "Driven by curiosity, you're at the forefront of innovation, eager to explore and share knowledge that could change the world."
+        self.goal = goal or "Uncover groundbreaking technologies in AI"
+        self.temperature = temperature or 0.1
+        self.allow_delegation = allow_delegation if allow_delegation is not None else False
+        self.verbose = verbose if verbose is not None else True
+        self.llm_provider_model = llm_providers_and_models()[0] if llm_provider_model is None else llm_provider_model
+        self.created_at = created_at or datetime.now().isoformat()
+        self.tools = tools or []
+        self.max_iter = max_iter or 25
+        self.cache = cache if cache is not None else True
+        self.knowledge_source_ids = knowledge_source_ids or []
+        self.edit_key = f'edit_{self.id}'
+        if self.edit_key not in ss:
+            ss[self.edit_key] = False
+
+    @property
+    def edit(self):
+        return ss[self.edit_key]
+
+    @edit.setter
+    def edit(self, value):
+        ss[self.edit_key] = value
+
+    def get_crewai_agent(self) -> Agent:
+        llm = create_llm(self.llm_provider_model, temperature=self.temperature)
+        tools = [tool.create_tool() for tool in self.tools]
+        
+        # Add knowledge sources if they exist
+        knowledge_sources = []
+        if 'knowledge_sources' in ss and self.knowledge_source_ids:
+            valid_knowledge_source_ids = []
+            
+            for ks_id in self.knowledge_source_ids:
+                ks = next((k for k in ss.knowledge_sources if k.id == ks_id), None)
+                if ks:
+                    try:
+                        knowledge_sources.append(ks.get_crewai_knowledge_source())
+                        valid_knowledge_source_ids.append(ks_id)
+                    except Exception as e:
+                        print(f"Error loading knowledge source {ks.id}: {str(e)}")
+        if knowledge_sources:
+            print(f"Loaded {len(knowledge_sources)} knowledge sources for agent {self.id}")
+            print(knowledge_sources)
+        return Agent(
+            role=self.role,
+            backstory=self.backstory,
+            goal=self.goal,
+            allow_delegation=self.allow_delegation,
+            verbose=self.verbose,
+            max_iter=self.max_iter,
+            cache=self.cache,
+            tools=tools,
+            llm=llm,
+            knowledge_sources=knowledge_sources if knowledge_sources else None
+        )
+
+    def delete(self):
+        ss.agents = [agent for agent in ss.agents if agent.id != self.id]
+        delete_agent(self.id)
+
+    def get_tool_display_name(self, tool):
+        first_param_name = tool.get_parameter_names()[0] if tool.get_parameter_names() else None
+        first_param_value = tool.parameters.get(first_param_name, '') if first_param_name else ''
+        return f"{tool.name} ({first_param_value if first_param_value else tool.tool_id})"
+
+    def is_valid(self, show_warning=False):
+        for tool in self.tools:
+            if not tool.is_valid(show_warning=show_warning):
+                if show_warning:
+                    st.warning(f"Tool {tool.name} is not valid")
+                return False
+        return True
+
+    def validate_llm_provider_model(self):
+        available_models = llm_providers_and_models()
+        if self.llm_provider_model not in available_models:
+            self.llm_provider_model = available_models[0]
+
+    def draw(self, key=None):
+        self.validate_llm_provider_model()
+        expander_title = f"{self.role[:60]} -{self.llm_provider_model.split(':')[1]}" if self.is_valid() else f"❗ {self.role[:20]} -{self.llm_provider_model.split(':')[1]}"
+        form_key = f'form_{self.id}_{key}' if key else f'form_{self.id}'        
+        if self.edit:
+            with st.expander(f"Agent: {self.role}", expanded=True):
+                with st.form(key=form_key):
+                    self.role = st.text_input("Role", value=self.role)
+                    self.backstory = st.text_area("Backstory", value=self.backstory)
+                    self.goal = st.text_area("Goal", value=self.goal)
+                    self.allow_delegation = st.checkbox("Allow delegation", value=self.allow_delegation)
+                    self.verbose = st.checkbox("Verbose", value=self.verbose)
+                    self.cache = st.checkbox("Cache", value=self.cache)
+                    self.llm_provider_model = st.selectbox("LLM Provider and Model", options=llm_providers_and_models(), index=llm_providers_and_models().index(self.llm_provider_model))
+                    self.temperature = st.slider("Temperature", value=self.temperature, min_value=0.0, max_value=1.0)
+                    self.max_iter = st.number_input("Max Iterations", value=self.max_iter, min_value=1, max_value=100)                    
+                    enabled_tools = [tool for tool in ss.tools]
+                    tools_key = f"{self.id}_tools_{key}" if key else f"{self.id}_tools"
+                    selected_tools = st.multiselect(
+                        "Select Tools",
+                        [self.get_tool_display_name(tool) for tool in enabled_tools],
+                        default=[self.get_tool_display_name(tool) for tool in self.tools],
+                        key=tools_key
+                    )                    
+                    if 'knowledge_sources' in ss and len(ss.knowledge_sources) > 0:
+                        knowledge_source_options = [ks.id for ks in ss.knowledge_sources]
+                        knowledge_source_labels = {ks.id: ks.name for ks in ss.knowledge_sources}
+                        
+                        # Filter out any knowledge source IDs that no longer exist
+                        valid_knowledge_sources = [ks_id for ks_id in self.knowledge_source_ids 
+                                                if ks_id in knowledge_source_options]
+                        
+                        # If we filtered out any IDs, update the agent's knowledge sources
+                        if len(valid_knowledge_sources) != len(self.knowledge_source_ids):
+                            self.knowledge_source_ids = valid_knowledge_sources
+                            save_agent(self)
+                        
+                        # Generate a unique key for the knowledge sources multiselect
+                        ks_key = f"knowledge_sources_{self.id}_{key}" if key else f"knowledge_sources_{self.id}"
+                        
+                        # Now use the filtered list for the multiselect with the unique key
+                        selected_knowledge_sources = st.multiselect(
+                            "Knowledge Sources",
+                            options=knowledge_source_options,
+                            default=valid_knowledge_sources,
+                            format_func=lambda x: knowledge_source_labels.get(x, "Unknown"),
+                            key=ks_key
+                        )
+                        self.knowledge_source_ids = selected_knowledge_sources                
+                    submitted = st.form_submit_button("Save")
+                    if submitted:
+                        self.tools = [tool for tool in enabled_tools if self.get_tool_display_name(tool) in selected_tools]
+                        self.set_editable(False)
+        else:
+            fix_columns_width()
+            with st.expander(expander_title, expanded=False):
+                st.markdown(f"**Role:** {self.role}")
+                st.markdown(f"**Backstory:** {self.backstory}")
+                st.markdown(f"**Goal:** {self.goal}")
+                st.markdown(f"**Allow delegation:** {self.allow_delegation}")
+                st.markdown(f"**Verbose:** {self.verbose}")
+                st.markdown(f"**Cache:** {self.cache}")
+                st.markdown(f"**LLM Provider and Model:** {self.llm_provider_model}")
+                st.markdown(f"**Temperature:** {self.temperature}")
+                st.markdown(f"**Max Iterations:** {self.max_iter}")
+                st.markdown(f"**Tools:** {[self.get_tool_display_name(tool) for tool in self.tools]}")                
+                # Display knowledge sources
+                if self.knowledge_source_ids and 'knowledge_sources' in ss:
+                    knowledge_sources = [ks for ks in ss.knowledge_sources if ks.id in self.knowledge_source_ids]
+                    if knowledge_sources:
+                        st.markdown("**Knowledge Sources:**")
+                        for ks in knowledge_sources:
+                            st.markdown(f"- {ks.name}")
+                self.is_valid(show_warning=True)
+                col1, col2 = st.columns(2)
+                with col1:
+                    btn_key = f"edit_btn_{rnd_id()}"
+                    st.button("Edit", on_click=self.set_editable, args=(True,), key=btn_key)
+                with col2:
+                    del_key = f"del_btn_{rnd_id()}"
+                    st.button("Delete", on_click=self.delete, key=del_key)
+
+    def set_editable(self, edit):
+        self.edit = edit
+        save_agent(self)
+        if not edit:
+            st.rerun()
+----------------------------------
+File: C:\Projects\CrewAI-Studio\app\my_crew.py
+from crewai import Crew, Process
+import streamlit as st
+from utils import rnd_id, fix_columns_width
+from streamlit import session_state as ss
+from datetime import datetime
+from llms import llm_providers_and_models, create_llm
+import db_utils
+
+class MyCrew:
+    def __init__(self, id=None, name=None, agents=None, tasks=None, process=None, cache=None, max_rpm=None, verbose=None, manager_llm=None, manager_agent=None, created_at=None, memory=None, planning=None, knowledge_source_ids=None):
+        self.id = id or "C_" + rnd_id()
+        self.name = name or "Crew 1"
+        self.agents = agents or []
+        self.tasks = tasks or []
+        self.process = process or Process.sequential
+        self.verbose = bool(verbose) if verbose is not None else True
+        self.manager_llm = manager_llm
+        self.manager_agent = manager_agent
+        self.memory = memory if memory is not None else False
+        self.cache = cache if cache is not None else True
+        self.max_rpm = max_rpm or 1000
+        self.planning = planning if planning is not None else False
+        self.created_at = created_at or datetime.now().isoformat()
+        self.knowledge_source_ids = knowledge_source_ids or []
+        self.edit_key = f'edit_{self.id}'
+        if self.edit_key not in ss:
+            ss[self.edit_key] = False
+        self.tasks_order_key = f'tasks_order_{self.id}'
+        if self.tasks_order_key not in ss:
+            ss[self.tasks_order_key] = [task.id for task in self.tasks]
+
+    @property
+    def edit(self):
+        return ss[self.edit_key]
+
+    @edit.setter
+    def edit(self, value):
+        ss[self.edit_key] = value
+
+    def get_crewai_crew(self, *args, **kwargs) -> Crew:
+        crewai_agents = [agent.get_crewai_agent() for agent in self.agents]
+
+        # Create a dictionary to hold the Task objects
+        task_objects = {}
+
+        def create_task(task):
+            if task.id in task_objects:
+                return task_objects[task.id]
+
+            context_tasks = []
+            if task.async_execution or task.context_from_async_tasks_ids or task.context_from_sync_tasks_ids:
+                for context_task_id in (task.context_from_async_tasks_ids or []) + (task.context_from_sync_tasks_ids or []):
+                    if context_task_id not in task_objects:
+                        context_task = next((t for t in self.tasks if t.id == context_task_id), None)
+                        if context_task:
+                            context_tasks.append(create_task(context_task))
+                        else:
+                            print(f"Warning: Context task with id {context_task_id} not found for task {task.id}")
+                    else:
+                        context_tasks.append(task_objects[context_task_id])
+
+            # Only pass context if it's an async task or if specific context is defined
+            if task.async_execution or context_tasks:
+                crewai_task = task.get_crewai_task(context_from_async_tasks=context_tasks)
+            else:
+                crewai_task = task.get_crewai_task()
+
+            task_objects[task.id] = crewai_task
+            return crewai_task
+
+        # Create all tasks, resolving dependencies recursively
+        for task in self.tasks:
+            create_task(task)
+
+        # Collect the final list of tasks in the original order
+        crewai_tasks = [task_objects[task.id] for task in self.tasks]
+
+        # Add knowledge sources if they exist
+        knowledge_sources = []
+        if 'knowledge_sources' in ss and self.knowledge_source_ids:
+            valid_knowledge_source_ids = []
+            
+            for ks_id in self.knowledge_source_ids:
+                ks = next((k for k in ss.knowledge_sources if k.id == ks_id), None)
+                if ks:
+                    try:
+                        knowledge_sources.append(ks.get_crewai_knowledge_source())
+                        valid_knowledge_source_ids.append(ks_id)
+                    except Exception as e:
+                        print(f"Error loading knowledge source {ks.id}: {str(e)}")
+            
+            # If any knowledge sources were invalid, update the list
+            if len(valid_knowledge_source_ids) != len(self.knowledge_source_ids):
+                self.knowledge_source_ids = valid_knowledge_source_ids
+                db_utils.save_crew(self)
+
+        # Create the crew with knowledge sources
+        if self.manager_llm:
+            return Crew(
+                agents=crewai_agents,
+                tasks=crewai_tasks,
+                cache=self.cache,
+                process=self.process,
+                max_rpm=self.max_rpm,
+                verbose=self.verbose,
+                manager_llm=create_llm(self.manager_llm),
+                memory=self.memory,
+                planning=self.planning,
+                knowledge_sources=knowledge_sources if knowledge_sources else None,
+                *args, **kwargs
+            )
+        elif self.manager_agent:
+            return Crew(
+                agents=crewai_agents,
+                tasks=crewai_tasks,
+                cache=self.cache,
+                process=self.process,
+                max_rpm=self.max_rpm,
+                verbose=self.verbose,
+                manager_agent=self.manager_agent.get_crewai_agent(),
+                memory=self.memory,
+                planning=self.planning,
+                knowledge_sources=knowledge_sources if knowledge_sources else None,
+                *args, **kwargs
+            )
+        cr = Crew(
+            agents=crewai_agents,
+            tasks=crewai_tasks,
+            cache=self.cache,
+            process=self.process,
+            max_rpm=self.max_rpm,
+            verbose=self.verbose,
+            memory=self.memory,
+            planning=self.planning,
+            knowledge_sources=knowledge_sources if knowledge_sources else None,
+            *args, **kwargs
+        )
+        return cr
+    
+    def update_knowledge_sources(self):
+        self.knowledge_source_ids = ss[f'knowledge_sources_{self.id}']
+        db_utils.save_crew(self)
+
+    def delete(self):
+        ss.crews = [crew for crew in ss.crews if crew.id != self.id]
+        db_utils.delete_crew(self.id)
+
+    def update_name(self):
+        self.name = ss[f'name_{self.id}']
+        db_utils.save_crew(self)
+
+    def update_process(self):
+        self.process = ss[f'process_{self.id}']
+        db_utils.save_crew(self)
+
+    def update_tasks(self):
+        selected_tasks_ids = ss[f'tasks_{self.id}']
+        self.tasks = [task for task in ss.tasks if task.id in selected_tasks_ids and task.agent.id in [agent.id for agent in self.agents]]
+        self.tasks = sorted(self.tasks, key=lambda task: selected_tasks_ids.index(task.id))
+        ss[self.tasks_order_key] = selected_tasks_ids
+        db_utils.save_crew(self)
+
+    def update_verbose(self):
+        self.verbose = ss[f'verbose_{self.id}']
+        db_utils.save_crew(self)
+
+    def update_agents(self):
+        selected_agents = ss[f'agents_{self.id}']
+        self.agents = [agent for agent in ss.agents if agent.role in selected_agents]        
+        db_utils.save_crew(self)
+
+    def update_manager_llm(self):
+        selected_llm = ss[f'manager_llm_{self.id}']
+        self.manager_llm = selected_llm if selected_llm != "None" else None
+        if self.manager_llm:
+            self.manager_agent = None
+        db_utils.save_crew(self)
+
+    def update_manager_agent(self):
+        selected_agent_role = ss[f'manager_agent_{self.id}']
+        self.manager_agent = next((agent for agent in ss.agents if agent.role == selected_agent_role), None) if selected_agent_role != "None" else None
+        if self.manager_agent:
+            self.manager_llm = None
+        db_utils.save_crew(self)
+
+    def update_memory(self):
+        self.memory = ss[f'memory_{self.id}']
+        db_utils.save_crew(self)
+    
+    def update_max_rpm(self):
+        self.max_rpm = ss[f'max_rpm_{self.id}']
+        db_utils.save_crew(self)
+
+    def update_cache(self):
+        self.cache = ss[f'cache_{self.id}']
+        db_utils.save_crew(self)
+
+    def update_planning(self):
+        self.planning = ss[f'planning_{self.id}']
+        db_utils.save_crew(self)
+
+    def is_valid(self, show_warning=False):
+        if len(self.agents) == 0:
+            if show_warning:
+                st.warning(f"Crew {self.name} has no agents")
+            return False
+        if len(self.tasks) == 0:
+            if show_warning:
+                st.warning(f"Crew {self.name} has no tasks")
+            return False
+        if any([not agent.is_valid(show_warning=show_warning) for agent in self.agents]):
+            return False
+        if any([not task.is_valid(show_warning=show_warning) for task in self.tasks]):
+            return False
+        if self.process == Process.hierarchical and not (self.manager_llm or self.manager_agent):
+            if show_warning:
+                st.warning(f"Crew {self.name} has no manager agent or manager llm set for hierarchical process")
+            return False
+        return True
+
+    def validate_manager_llm(self):
+        available_models = llm_providers_and_models()
+        if self.manager_llm and self.manager_llm not in available_models:
+            self.manager_llm = None
+
+    def draw(self,expanded=False, buttons=True):
+        self.validate_manager_llm()
+        name_key = f"name_{self.id}"
+        process_key = f"process_{self.id}"
+        verbose_key = f"verbose_{self.id}"
+        agents_key = f"agents_{self.id}"
+        tasks_key = f"tasks_{self.id}"
+        manager_llm_key = f"manager_llm_{self.id}"
+        manager_agent_key = f"manager_agent_{self.id}"
+        memory_key = f"memory_{self.id}"
+        planning_key = f"planning_{self.id}"
+        cache_key = f"cache_{self.id}"
+        max_rpm_key = f"max_rpm_{self.id}"
+        
+        if self.edit:
+            with st.container(border=True):
+                st.text_input("Name (just id, it doesn't affect anything)", value=self.name, key=name_key, on_change=self.update_name)
+                st.selectbox("Process", options=[Process.sequential, Process.hierarchical], index=[Process.sequential, Process.hierarchical].index(self.process), key=process_key, on_change=self.update_process)
+                st.multiselect("Agents", options=[agent.role for agent in ss.agents], default=[agent.role for agent in self.agents], key=agents_key, on_change=self.update_agents)                
+                # Filter tasks by selected agents
+                available_tasks = [task for task in ss.tasks if task.agent and task.agent.id in [agent.id for agent in self.agents]]
+                available_task_ids = [task.id for task in available_tasks]
+                default_task_ids = [task.id for task in self.tasks if task.id in available_task_ids]             
+                st.multiselect("Tasks", options=available_task_ids, default=default_task_ids, format_func=lambda x: next(task.description for task in ss.tasks if task.id == x), key=tasks_key, on_change=self.update_tasks)                
+                st.selectbox("Manager LLM", options=["None"] + llm_providers_and_models(), index=0 if self.manager_llm is None else llm_providers_and_models().index(self.manager_llm) + 1, key=manager_llm_key, on_change=self.update_manager_llm, disabled=(self.process != Process.hierarchical))
+                st.selectbox("Manager Agent", options=["None"] + [agent.role for agent in ss.agents], index=0 if self.manager_agent is None else [agent.role for agent in ss.agents].index(self.manager_agent.role) + 1, key=manager_agent_key, on_change=self.update_manager_agent, disabled=(self.process != Process.hierarchical))
+                st.checkbox("Verbose", value=self.verbose, key=verbose_key, on_change=self.update_verbose)
+                st.checkbox("Memory", value=self.memory, key=memory_key, on_change=self.update_memory)
+                st.checkbox("Cache", value=self.cache, key=cache_key, on_change=self.update_cache)
+                st.checkbox("Planning", value=self.planning, key=planning_key, on_change=self.update_planning)
+                st.number_input("Max req/min", value=self.max_rpm, key=max_rpm_key, on_change=self.update_max_rpm)  
+                # for some reason knowledge sources for crews are not working, use the knowledge sources in the agents instead
+                # if 'knowledge_sources' in ss and len(ss.knowledge_sources) > 0:
+                #     knowledge_source_options = [ks.id for ks in ss.knowledge_sources]
+                #     knowledge_source_labels = {ks.id: ks.name for ks in ss.knowledge_sources}
+                #     valid_knowledge_sources = [ks_id for ks_id in self.knowledge_source_ids 
+                #                             if ks_id in knowledge_source_options]
+
+                #     if len(valid_knowledge_sources) != len(self.knowledge_source_ids):
+                #         self.knowledge_source_ids = valid_knowledge_sources
+                #         db_utils.save_crew(self)
+                #     st.multiselect(
+                #         "Knowledge Sources",
+                #         options=knowledge_source_options,
+                #         default=valid_knowledge_sources,
+                #         format_func=lambda x: knowledge_source_labels.get(x, "Unknown"),
+                #         key=f"knowledge_sources_{self.id}",
+                #         on_change=self.update_knowledge_sources
+                #     )
+
+                st.button("Save", on_click=self.set_editable, args=(False,), key=rnd_id())
+        else:
+            fix_columns_width()
+            expander_title = f"Crew: {self.name}" if self.is_valid() else f"❗ Crew: {self.name}"
+            with st.expander(expander_title, expanded=expanded):
+                st.markdown(f"**Process:** {self.process}")
+                if self.process == Process.hierarchical:
+                    st.markdown(f"**Manager LLM:** {self.manager_llm}")
+                    st.markdown(f"**Manager Agent:** {self.manager_agent.role if self.manager_agent else 'None'}")
+                st.markdown(f"**Verbose:** {self.verbose}")
+                st.markdown(f"**Memory:** {self.memory}")
+                st.markdown(f"**Cache:** {self.cache}")
+                st.markdown(f"**Planning:** {self.planning}")
+                st.markdown(f"**Max req/min:** {self.max_rpm}")
+                st.markdown("**Tasks:**")
+                for i, task in enumerate([task for task in self.tasks if task.agent and task.agent.id in [agent.id for agent in self.agents]], 1):
+                    with st.container(border=True):
+                        async_tag = "(async)" if task.async_execution else ""
+                        st.markdown(f"**{i}.{async_tag}  {task.description}**")
+                        st.markdown(f"**Agent:** {task.agent.role if task.agent else 'None'}")
+                        tools_list = ", ".join([tool.name for tool in task.agent.tools]) if task.agent else "None"
+                        st.markdown(f" **Tools:** {tools_list}")
+                        st.markdown(f" **LLM:** {task.agent.llm_provider_model}")
+                if self.knowledge_source_ids and 'knowledge_sources' in ss:
+                    source_names = [ks.name for ks in ss.knowledge_sources if ks.id in self.knowledge_source_ids]
+                    st.markdown(f"**Knowledge Sources:** {', '.join(source_names)}")
+                if buttons:
+                    col1, col2 = st.columns(2)
+                    with col1:                    
+                        st.button("Edit", on_click=self.set_editable, key=rnd_id(), args=(True,))
+                    with col2:                   
+                        st.button("Delete", on_click=self.delete, key=rnd_id())
+                self.is_valid(show_warning=True)
+
+    def set_editable(self, edit):
+        self.edit = edit
+        db_utils.save_crew(self)
+----------------------------------
+File: C:\Projects\CrewAI-Studio\app\my_knowledge_source.py
+from datetime import datetime
+from utils import rnd_id, fix_columns_width
+from streamlit import session_state as ss
+import streamlit as st
+import os
+import db_utils
+from pathlib import Path  # Using Path for cross-platform path handling
+
+class MyKnowledgeSource:
+    def __init__(self, id=None, name=None, source_type=None, source_path=None, 
+                content=None, metadata=None, chunk_size=None, chunk_overlap=None, 
+                created_at=None):
+        self.id = id or "KS_" + rnd_id()
+        self.name = name or "Knowledge Source 1"
+        self.source_type = source_type or "string"  # string, text_file, pdf, csv, excel, json, docling
+        self.source_path = source_path or ""  # For file-based sources
+        self.content = content or ""  # For string-based sources
+        self.metadata = metadata or {}
+        self.chunk_size = chunk_size or 4000
+        self.chunk_overlap = chunk_overlap or 200
+        self.created_at = created_at or datetime.now().isoformat()
+        self.edit_key = f'edit_{self.id}'
+        if self.edit_key not in ss:
+            ss[self.edit_key] = False
+
+    @property
+    def edit(self):
+        return ss[self.edit_key]
+
+    @edit.setter
+    def edit(self, value):
+        ss[self.edit_key] = value
+
+    def find_file(self, file_path):
+        """
+        Tries to find the file at various possible locations.
+        Returns the correct path if found, or None if not found.
+        """
+        if not file_path:
+            return None
+        else: #simply check if the file exists in the folder knowledge
+            if Path("knowledge", file_path).exists():
+                return file_path
+            else:
+                return None
+
+    def get_crewai_knowledge_source(self):
+        # Import knowledge source classes based on type
+        if self.source_type == "string":
+            from crewai.knowledge.source.string_knowledge_source import StringKnowledgeSource
+            return StringKnowledgeSource(
+                content=self.content,
+                metadata=self.metadata,
+                chunk_size=self.chunk_size,
+                chunk_overlap=self.chunk_overlap
+            )
+        elif self.source_type == "docling":
+            from crewai.knowledge.source.crew_docling_source import CrewDoclingSource
+            return CrewDoclingSource(
+                file_paths=[self.source_path],
+                metadata=self.metadata,
+                chunk_size=self.chunk_size,
+                chunk_overlap=self.chunk_overlap
+            )
+        else:
+            # For file-based sources, find the actual file path
+            actual_path = self.find_file(self.source_path)
+            if not actual_path:
+                raise FileNotFoundError(f"File not found: {self.source_path}")
+                
+            # Import the appropriate class based on source type
+            if self.source_type == "text_file":
+                from crewai.knowledge.source.text_file_knowledge_source import TextFileKnowledgeSource
+                return TextFileKnowledgeSource(
+                    file_paths=[actual_path],
+                    metadata=self.metadata,
+                    chunk_size=self.chunk_size,
+                    chunk_overlap=self.chunk_overlap
+                )
+            elif self.source_type == "pdf":
+                from crewai.knowledge.source.pdf_knowledge_source import PDFKnowledgeSource               
+                return PDFKnowledgeSource(
+                    file_paths=[actual_path],
+                    metadata=self.metadata,
+                    chunk_size=self.chunk_size,
+                    chunk_overlap=self.chunk_overlap
+                )
+            elif self.source_type == "csv":
+                from crewai.knowledge.source.csv_knowledge_source import CSVKnowledgeSource
+                return CSVKnowledgeSource(
+                    file_paths=[actual_path],
+                    metadata=self.metadata,
+                    chunk_size=self.chunk_size,
+                    chunk_overlap=self.chunk_overlap
+                )
+            elif self.source_type == "excel":
+                from crewai.knowledge.source.excel_knowledge_source import ExcelKnowledgeSource
+                return ExcelKnowledgeSource(
+                    file_paths=[actual_path],
+                    metadata=self.metadata,
+                    chunk_size=self.chunk_size,
+                    chunk_overlap=self.chunk_overlap
+                )
+            elif self.source_type == "json":
+                from crewai.knowledge.source.json_knowledge_source import JSONKnowledgeSource
+                return JSONKnowledgeSource(
+                    file_paths=[actual_path],
+                    metadata=self.metadata,
+                    chunk_size=self.chunk_size,
+                    chunk_overlap=self.chunk_overlap
+                )
+            else:
+                raise ValueError(f"Unsupported knowledge source type: {self.source_type}")
+
+    def is_valid(self, show_warning=False):
+        # Validate the knowledge source based on its type
+        if self.source_type == "string" and not self.content:
+            if show_warning:
+                st.warning(f"Knowledge source {self.name} has no content")
+            return False
+        
+        if self.source_type != "string" and self.source_type != "docling" and not self.source_path:
+            if show_warning:
+                st.warning(f"Knowledge source {self.name} has no source path")
+            return False
+            
+        # For file-based sources, check if the file exists (except for docling URLs)
+        if self.source_type != "string" and self.source_type != "docling":
+            actual_path = self.find_file(self.source_path)
+            if not actual_path:
+                if show_warning:
+                    st.warning(f"File not found: {self.source_path}")
+                return False
+
+            
+        return True
+
+    def delete(self):
+        ss.knowledge_sources = [ks for ks in ss.knowledge_sources if ks.id != self.id]
+        db_utils.delete_knowledge_source(self.id)
+
+    def draw(self, key=None):
+        source_types = {
+            "string": "Text String",
+            "text_file": "Text File (.txt)",
+            "pdf": "PDF Document",
+            "csv": "CSV File",
+            "excel": "Excel File",
+            "json": "JSON File",
+            "docling": "DocLing (URL or file)"
+        }
+        
+        # Create an ID for the upload field that includes both the knowledge source ID and type
+        # This ensures the field is recreated when the type changes
+        upload_field_id = f"uploader_{self.id}_{self.source_type}"
+        
+        if self.edit:
+            # Use a container instead of an expander for the main form
+            with st.container():
+                st.subheader(f"Knowledge Source: {self.name}")
+                
+                # Name and type are outside the form to trigger immediate updates
+                self.name = st.text_input("Name", value=self.name, key=f"name_{self.id}")
+                
+                prev_type = self.source_type
+                self.source_type = st.selectbox(
+                    "Source Type", 
+                    options=list(source_types.keys()),
+                    format_func=lambda x: source_types[x],
+                    index=list(source_types.keys()).index(self.source_type),
+                    key=f"type_{self.id}"
+                )
+                
+                # If type changed, save immediately to trigger rerender
+                if prev_type != self.source_type:
+                    db_utils.save_knowledge_source(self)
+                    st.rerun()
+                
+                # Create the form for the rest of the fields
+                with st.form(key=f'form_{self.id}' if key is None else key):
+                    if self.source_type == "string":
+                        self.content = st.text_area("Content", value=self.content, height=200)
+                    else:
+                        self.source_path = st.text_input(
+                            "Source Path", 
+                            value=self.source_path,
+                            help="Enter file path relative to the 'knowledge' directory or a URL for docling"
+                        )
+                        
+                        # File uploader for local files
+                        if self.source_type != "docling":
+                            # Define file types for the uploader based on source type
+                            upload_types = {
+                                "text_file": "txt", 
+                                "pdf": "pdf", 
+                                "csv": "csv", 
+                                "excel": ["xlsx", "xls"], 
+                                "json": "json"
+                            }
+                            
+                            file_type = upload_types.get(self.source_type)
+                            if file_type:
+                                uploaded_file = st.file_uploader(
+                                    f"Upload {source_types[self.source_type]}", 
+                                    type=file_type,
+                                    key=upload_field_id
+                                )
+                                
+                                if uploaded_file is not None:
+                                    # Create knowledge directory if it doesn't exist
+                                    os.makedirs("knowledge", exist_ok=True)
+                                    
+                                    # Save the uploaded file to the knowledge directory
+                                    file_name = uploaded_file.name                                   
+                                    file_path = os.path.join("knowledge", file_name)
+                                    
+                                    with open(file_path, "wb") as f:
+                                        f.write(uploaded_file.getbuffer())
+                                    
+                                    # Set the source path to just the filename with knowledge prefix
+                                    self.source_path = file_name
+                    
+                    # Advanced settings
+                    st.subheader("Advanced Settings")
+                    
+                    # Chunk configuration
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        self.chunk_size = st.number_input(
+                            "Chunk Size", 
+                            value=self.chunk_size,
+                            min_value=100,
+                            max_value=8000,
+                            help="Maximum size of each chunk (default: 4000)"
+                        )
+                    with col2:
+                        self.chunk_overlap = st.number_input(
+                            "Chunk Overlap", 
+                            value=self.chunk_overlap,
+                            min_value=0,
+                            max_value=1000,
+                            help="Overlap between chunks (default: 200)"
+                        )
+                    
+                    # Metadata section
+                    st.subheader("Metadata (optional)")
+                    col1, col2 = st.columns([3, 1])
+                    with col1:
+                        metadata_key = st.text_input("Key", key=f"metadata_key_{self.id}")
+                        metadata_value = st.text_input("Value", key=f"metadata_value_{self.id}")
+                    with col2:
+                        add_metadata = st.form_submit_button("Add Metadata")
+                        if add_metadata and metadata_key:
+                            self.metadata[metadata_key] = metadata_value
+                            st.rerun()
+                    
+                    # Display current metadata
+                    if self.metadata:
+                        st.write("Current Metadata:")
+                        for key, value in dict(self.metadata).items():
+                            col1, col2, col3 = st.columns([3, 3, 1])
+                            with col1:
+                                st.text(key)
+                            with col2:
+                                st.text(value)
+                            with col3:
+                                remove_key = st.form_submit_button(f"Remove {key[:6]}...")
+                                if remove_key:
+                                    self.metadata.pop(key)
+                                    st.rerun()
+                    
+                    # Save button for the entire form
+                    submitted = st.form_submit_button("Save Knowledge Source")
+                    if submitted:
+                        db_utils.save_knowledge_source(self)
+                        self.set_editable(False)
+        else:
+            fix_columns_width()
+            source_name = f"{self.name}" if self.is_valid() else f"❗ {self.name}"
+            with st.expander(source_name, expanded=False):
+                st.markdown(f"**Name:** {self.name}")
+                st.markdown(f"**Type:** {source_types[self.source_type]}")
+                
+                if self.source_type == "string":
+                    preview = self.content[:100] + "..." if len(self.content) > 100 else self.content
+                    st.markdown(f"**Content Preview:** {preview}")
+                else:
+                    st.markdown(f"**Source Path:** {self.source_path}")
+                
+                st.markdown(f"**Chunk Size:** {self.chunk_size}")
+                st.markdown(f"**Chunk Overlap:** {self.chunk_overlap}")
+                
+                if self.metadata:
+                    st.markdown("**Metadata:**")
+                    for key, value in self.metadata.items():
+                        st.markdown(f"- {key}: {value}")
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.button("Edit", on_click=self.set_editable, args=(True,), key=rnd_id())
+                with col2:
+                    st.button("Delete", on_click=self.delete, key=rnd_id())
+                
+                self.is_valid(show_warning=True)
+
+    def set_editable(self, edit):
+        self.edit = edit
+        db_utils.save_knowledge_source(self)
+        if not edit:
+            st.rerun()
+----------------------------------
+File: C:\Projects\CrewAI-Studio\app\my_task.py
+from crewai import Task
+import streamlit as st
+from utils import rnd_id, fix_columns_width
+from streamlit import session_state as ss
+from db_utils import save_task, delete_task
+from datetime import datetime
+
+class MyTask:
+    def __init__(self, id=None, description=None, expected_output=None, agent=None, async_execution=None, created_at=None, context_from_async_tasks_ids=None, context_from_sync_tasks_ids=None, **kwargs):
+        self.id = id or "T_" + rnd_id()
+        self.description = description or "Identify the next big trend in AI. Focus on identifying pros and cons and the overall narrative."
+        self.expected_output = expected_output or "A comprehensive 3 paragraphs long report on the latest AI trends."
+        self.agent = agent or ss.agents[0] if ss.agents else None
+        self.async_execution = async_execution or False
+        self.context_from_async_tasks_ids = context_from_async_tasks_ids or None
+        self.context_from_sync_tasks_ids = context_from_sync_tasks_ids or None
+        self.created_at = created_at or datetime.now().isoformat()
+        self.edit_key = f'edit_{self.id}'
+        if self.edit_key not in ss:
+            ss[self.edit_key] = False
+
+    @property
+    def edit(self):
+        return ss[self.edit_key]
+
+    @edit.setter
+    def edit(self, value):
+        ss[self.edit_key] = value
+
+    def get_crewai_task(self, context_from_async_tasks=None, context_from_sync_tasks=None) -> Task:
+        context = []
+        if context_from_async_tasks:
+            context.extend(context_from_async_tasks)
+        if context_from_sync_tasks:
+            context.extend(context_from_sync_tasks)
+        
+        if context:
+            return Task(description=self.description, expected_output=self.expected_output, async_execution=self.async_execution, agent=self.agent.get_crewai_agent(), context=context)
+        else:
+            return Task(description=self.description, expected_output=self.expected_output, async_execution=self.async_execution, agent=self.agent.get_crewai_agent())
+
+    def delete(self):
+        ss.tasks = [task for task in ss.tasks if task.id != self.id]
+        delete_task(self.id)
+
+    def is_valid(self, show_warning=False):
+        if not self.agent:
+            if show_warning:
+                st.warning(f"Task {self.description} has no agent")
+            return False
+        if not self.agent.is_valid(show_warning):
+            return False
+        return True
+
+    def draw(self, key=None):
+        agent_options = [agent.role for agent in ss.agents]
+        expander_title = f"({self.agent.role if self.agent else 'unassigned'}) - {self.description}" if self.is_valid() else f"❗ ({self.agent.role if self.agent else 'unassigned'}) - {self.description}"
+        if self.edit:
+            with st.expander(expander_title, expanded=True):
+                with st.form(key=f'form_{self.id}' if key is None else key):
+                    self.description = st.text_area("Description", value=self.description)
+                    self.expected_output = st.text_area("Expected output", value=self.expected_output)
+                    self.agent = st.selectbox("Agent", options=ss.agents, format_func=lambda x: x.role, index=0 if self.agent is None else agent_options.index(self.agent.role))
+                    self.async_execution = st.checkbox("Async execution", value=self.async_execution)
+                    self.context_from_async_tasks_ids = st.multiselect("Context from async tasks", options=[task.id for task in ss.tasks if task.async_execution], default=self.context_from_async_tasks_ids, format_func=lambda x: [task.description[:120] for task in ss.tasks if task.id == x][0])
+                    self.context_from_sync_tasks_ids = st.multiselect("Context from sync tasks", options=[task.id for task in ss.tasks if not task.async_execution], default=self.context_from_sync_tasks_ids, format_func=lambda x: [task.description[:120] for task in ss.tasks if task.id == x][0])
+                    submitted = st.form_submit_button("Save")
+                    if submitted:
+                        self.set_editable(False)
+        else:
+            fix_columns_width()
+            with st.expander(expander_title):
+                st.markdown(f"**Description:** {self.description}")
+                st.markdown(f"**Expected output:** {self.expected_output}")
+                st.markdown(f"**Agent:** {self.agent.role if self.agent else 'None'}")
+                st.markdown(f"**Async execution:** {self.async_execution}")
+                st.markdown(f"**Context from async tasks:** {', '.join([task.description[:120] for task in ss.tasks if task.id in self.context_from_async_tasks_ids]) if self.context_from_async_tasks_ids else 'None'}")
+                st.markdown(f"**Context from sync tasks:** {', '.join([task.description[:120] for task in ss.tasks if task.id in self.context_from_sync_tasks_ids]) if self.context_from_sync_tasks_ids else 'None'}")
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.button("Edit", on_click=self.set_editable, args=(True,), key=rnd_id())
+                with col2:
+                    st.button("Delete", on_click=self.delete, key=rnd_id())
+                self.is_valid(show_warning=True)
+
+    def set_editable(self, edit):
+        self.edit = edit
+        save_task(self)
+        if not edit:
+            st.rerun()
+----------------------------------
+File: C:\Projects\CrewAI-Studio\app\my_tools.py
+import streamlit as st
+import os
+from utils import rnd_id
+from crewai_tools import CodeInterpreterTool,ScrapeElementFromWebsiteTool,TXTSearchTool,SeleniumScrapingTool,PGSearchTool,PDFSearchTool,MDXSearchTool,JSONSearchTool,GithubSearchTool,EXASearchTool,DOCXSearchTool,CSVSearchTool,ScrapeWebsiteTool, FileReadTool, DirectorySearchTool, DirectoryReadTool, CodeDocsSearchTool, YoutubeVideoSearchTool,SerperDevTool,YoutubeChannelSearchTool,WebsiteSearchTool
+from tools.CSVSearchToolEnhanced import CSVSearchToolEnhanced
+from tools.CustomApiTool import CustomApiTool
+from tools.CustomCodeInterpreterTool import CustomCodeInterpreterTool
+from tools.CustomFileWriteTool import CustomFileWriteTool
+from tools.ScrapeWebsiteToolEnhanced import ScrapeWebsiteToolEnhanced
+from tools.AzureAIAssistantTool import AzureAIAssistantTool
+
+from langchain_community.tools import YahooFinanceNewsTool
+
+class MyTool:
+    def __init__(self, tool_id, name, description, parameters, **kwargs):
+        self.tool_id = tool_id or rnd_id()
+        self.name = name
+        self.description = description
+        self.parameters = kwargs
+        self.parameters_metadata = parameters
+
+    def create_tool(self):
+        pass
+
+    def get_parameters(self):
+        return self.parameters
+
+    def set_parameters(self, **kwargs):
+        self.parameters.update(kwargs)
+
+    def get_parameter_names(self):
+        return list(self.parameters_metadata.keys())
+
+    def is_parameter_mandatory(self, param_name):
+        return self.parameters_metadata.get(param_name, {}).get('mandatory', False)
+
+    def is_valid(self,show_warning=False):
+        for param_name, metadata in self.parameters_metadata.items():
+            if metadata['mandatory'] and not self.parameters.get(param_name):
+                if show_warning:
+                    st.warning(f"Parameter '{param_name}' is mandatory for tool '{self.name}'")
+                return False
+        return True
+
+class MyScrapeWebsiteTool(MyTool):
+    def __init__(self, tool_id=None, website_url=None):
+        parameters = {
+            'website_url': {'mandatory': False}
+        }
+        super().__init__(tool_id, 'ScrapeWebsiteTool', "A tool that can be used to read website content.", parameters, website_url=website_url)
+
+    def create_tool(self) -> ScrapeWebsiteTool:
+        return ScrapeWebsiteTool(self.parameters.get('website_url') if self.parameters.get('website_url') else None)
+
+class MyFileReadTool(MyTool):
+    def __init__(self, tool_id=None, file_path=None):
+        parameters = {
+            'file_path': {'mandatory': False}
+        }
+        super().__init__(tool_id, 'FileReadTool', "A tool that can be used to read a file's content.", parameters, file_path=file_path)
+
+    def create_tool(self) -> FileReadTool:
+        return FileReadTool(self.parameters.get('file_path') if self.parameters.get('file_path') else None)
+
+class MyDirectorySearchTool(MyTool):
+    def __init__(self, tool_id=None, directory=None):
+        parameters = {
+            'directory': {'mandatory': False}
+        }
+        super().__init__(tool_id, 'DirectorySearchTool', "A tool that can be used to semantic search a query from a directory's content.", parameters, directory_path=directory)
+
+    def create_tool(self) -> DirectorySearchTool:
+        return DirectorySearchTool(self.parameters.get('directory') if self.parameters.get('directory') else None)
+
+class MyDirectoryReadTool(MyTool):
+    def __init__(self, tool_id=None, directory_contents=None):
+        parameters = {
+            'directory_contents': {'mandatory': True}
+        }
+        super().__init__(tool_id, 'DirectoryReadTool', "Use the tool to list the contents of the specified directory", parameters, directory_contents=directory_contents)
+
+    def create_tool(self) -> DirectoryReadTool:
+        return DirectoryReadTool(self.parameters.get('directory_contents'))
+
+class MyCodeDocsSearchTool(MyTool):
+    def __init__(self, tool_id=None, code_docs=None):
+        parameters = {
+            'code_docs': {'mandatory': False}
+        }
+        super().__init__(tool_id, 'CodeDocsSearchTool', "A tool that can be used to search through code documentation.", parameters, code_docs=code_docs)
+
+    def create_tool(self) -> CodeDocsSearchTool:
+        return CodeDocsSearchTool(self.parameters.get('code_docs') if self.parameters.get('code_docs') else None)
+
+class MyYoutubeVideoSearchTool(MyTool):
+    def __init__(self, tool_id=None, youtube_video_url=None):
+        parameters = {
+            'youtube_video_url': {'mandatory': False}
+        }
+        super().__init__(tool_id, 'YoutubeVideoSearchTool', "A tool that can be used to semantic search a query from a Youtube Video content.", parameters, youtube_video_url=youtube_video_url)
+
+    def create_tool(self) -> YoutubeVideoSearchTool:
+        return YoutubeVideoSearchTool(self.parameters.get('youtube_video_url') if self.parameters.get('youtube_video_url') else None)
+
+class MySerperDevTool(MyTool):
+    def __init__(self, tool_id=None, SERPER_API_KEY=None):
+        parameters = {
+            'SERPER_API_KEY': {'mandatory': True}
+        }
+
+        super().__init__(tool_id, 'SerperDevTool', "A tool that can be used to search the internet with a search_query", parameters)
+
+    def create_tool(self) -> SerperDevTool:
+        os.environ['SERPER_API_KEY'] = self.parameters.get('SERPER_API_KEY')
+        return SerperDevTool()
+    
+class MyYoutubeChannelSearchTool(MyTool):
+    def __init__(self, tool_id=None, youtube_channel_handle=None):
+        parameters = {
+            'youtube_channel_handle': {'mandatory': False}
+        }
+        super().__init__(tool_id, 'YoutubeChannelSearchTool', "A tool that can be used to semantic search a query from a Youtube Channels content. Channel can be added as @channel", parameters, youtube_channel_handle=youtube_channel_handle)
+
+    def create_tool(self) -> YoutubeChannelSearchTool:
+        return YoutubeChannelSearchTool(self.parameters.get('youtube_channel_handle') if self.parameters.get('youtube_channel_handle') else None)
+
+class MyWebsiteSearchTool(MyTool):
+    def __init__(self, tool_id=None, website=None):
+        parameters = {
+            'website': {'mandatory': False}
+        }
+        super().__init__(tool_id, 'WebsiteSearchTool', "A tool that can be used to semantic search a query from a specific URL content.", parameters, website=website)
+
+    def create_tool(self) -> WebsiteSearchTool:
+        return WebsiteSearchTool(self.parameters.get('website') if self.parameters.get('website') else None)
+   
+class MyCSVSearchTool(MyTool):
+    def __init__(self, tool_id=None, csv=None):
+        parameters = {
+            'csv': {'mandatory': False}
+        }
+        super().__init__(tool_id, 'CSVSearchTool', "A tool that can be used to semantic search a query from a CSV's content.", parameters, csv=csv)
+
+    def create_tool(self) -> CSVSearchTool:
+        return CSVSearchTool(csv=self.parameters.get('csv') if self.parameters.get('csv') else None)
+
+class MyDocxSearchTool(MyTool):
+    def __init__(self, tool_id=None, docx=None):
+        parameters = {
+            'docx': {'mandatory': False}
+        }
+        super().__init__(tool_id, 'DOCXSearchTool', "A tool that can be used to semantic search a query from a DOCX's content.", parameters, docx=docx)
+
+    def create_tool(self) -> DOCXSearchTool:
+        return DOCXSearchTool(docx=self.parameters.get('docx') if self.parameters.get('docx') else None)
+
+class MyEXASearchTool(MyTool):
+    def __init__(self, tool_id=None, EXA_API_KEY=None):
+        parameters = {
+            'EXA_API_KEY': {'mandatory': True}
+        }
+        super().__init__(tool_id, 'EXASearchTool', "A tool that can be used to search the internet from a search_query", parameters, EXA_API_KEY=EXA_API_KEY)
+
+    def create_tool(self) -> EXASearchTool:
+        os.environ['EXA_API_KEY'] = self.parameters.get('EXA_API_KEY')
+        return EXASearchTool()
+
+class MyGithubSearchTool(MyTool):
+    def __init__(self, tool_id=None, github_repo=None, gh_token=None, content_types=None):
+        parameters = {
+            'github_repo': {'mandatory': False},
+            'gh_token': {'mandatory': True},
+            'content_types': {'mandatory': False}
+        }
+        super().__init__(tool_id, 'GithubSearchTool', "A tool that can be used to semantic search a query from a Github repository's content. Valid content_types: code,repo,pr,issue (comma sepparated)", parameters, github_repo=github_repo, gh_token=gh_token, content_types=content_types)
+
+    def create_tool(self) -> GithubSearchTool:
+        return GithubSearchTool(
+            github_repo=self.parameters.get('github_repo') if self.parameters.get('github_repo') else None,
+            gh_token=self.parameters.get('gh_token'),
+            content_types=self.parameters.get('search_query').split(",") if self.parameters.get('search_query') else ["code", "repo", "pr", "issue"]
+        )
+
+class MyJSONSearchTool(MyTool):
+    def __init__(self, tool_id=None, json_path=None):
+        parameters = {
+            'json_path': {'mandatory': False}
+        }
+        super().__init__(tool_id, 'JSONSearchTool', "A tool that can be used to semantic search a query from a JSON's content.", parameters, json_path=json_path)
+
+    def create_tool(self) -> JSONSearchTool:
+        return JSONSearchTool(json_path=self.parameters.get('json_path') if self.parameters.get('json_path') else None)
+
+class MyMDXSearchTool(MyTool):
+    def __init__(self, tool_id=None, mdx=None):
+        parameters = {
+            'mdx': {'mandatory': False}
+        }
+        super().__init__(tool_id, 'MDXSearchTool', "A tool that can be used to semantic search a query from a MDX's content.", parameters, mdx=mdx)
+
+    def create_tool(self) -> MDXSearchTool:
+        return MDXSearchTool(mdx=self.parameters.get('mdx') if self.parameters.get('mdx') else None)
+    
+class MyPDFSearchTool(MyTool):
+    def __init__(self, tool_id=None, pdf=None):
+        parameters = {
+            'pdf': {'mandatory': False}
+        }
+        super().__init__(tool_id, 'PDFSearchTool', "A tool that can be used to semantic search a query from a PDF's content.", parameters, pdf=pdf)
+
+    def create_tool(self) -> PDFSearchTool:
+        return PDFSearchTool(self.parameters.get('pdf') if self.parameters.get('pdf') else None)
+
+class MyPGSearchTool(MyTool):
+    def __init__(self, tool_id=None, db_uri=None):
+        parameters = {
+            'db_uri': {'mandatory': True}
+        }
+        super().__init__(tool_id, 'PGSearchTool', "A tool that can be used to semantic search a query from a database table's content.", parameters, db_uri=db_uri)
+
+    def create_tool(self) -> PGSearchTool:
+        return PGSearchTool(self.parameters.get('db_uri'))
+
+class MySeleniumScrapingTool(MyTool):
+    def __init__(self, tool_id=None, website_url=None, css_element=None, cookie=None, wait_time=None):
+        parameters = {
+            'website_url': {'mandatory': False},
+            'css_element': {'mandatory': False},
+            'cookie': {'mandatory': False},
+            'wait_time': {'mandatory': False}
+        }
+        super().__init__(
+            tool_id, 
+            'SeleniumScrapingTool', 
+            r"A tool that can be used to read a specific part of website content. CSS elements are separated by comma, cookies are in format {key1\:value1},{key2\:value2}", 
+            parameters, 
+            website_url=website_url, 
+            css_element=css_element, 
+            cookie=cookie, 
+            wait_time=wait_time
+)
+    def create_tool(self) -> SeleniumScrapingTool:
+        cookie_arrayofdicts = [{k: v} for k, v in (item.strip('{}').split(':') for item in self.parameters.get('cookie', '').split(','))] if self.parameters.get('cookie') else None
+
+        return SeleniumScrapingTool(
+            website_url=self.parameters.get('website_url') if self.parameters.get('website_url') else None,
+            css_element=self.parameters.get('css_element').split(',') if self.parameters.get('css_element') else None,
+            cookie=cookie_arrayofdicts,
+            wait_time=self.parameters.get('wait_time') if self.parameters.get('wait_time') else 10
+        )
+
+class MyTXTSearchTool(MyTool):
+    def __init__(self, tool_id=None, txt=None):
+        parameters = {
+            'txt': {'mandatory': False}
+        }
+        super().__init__(tool_id, 'TXTSearchTool', "A tool that can be used to semantic search a query from a TXT's content.", parameters, txt=txt)
+
+    def create_tool(self) -> TXTSearchTool:
+        return TXTSearchTool(self.parameters.get('txt'))
+
+class MyScrapeElementFromWebsiteTool(MyTool):
+    def __init__(self, tool_id=None, website_url=None, css_element=None, cookie=None):
+        parameters = {
+            'website_url': {'mandatory': False},
+            'css_element': {'mandatory': False},
+            'cookie': {'mandatory': False}
+        }
+        super().__init__(
+            tool_id, 
+            'ScrapeElementFromWebsiteTool', 
+            r"A tool that can be used to read a specific part of website content. CSS elements are separated by comma, cookies are in format {key1\:value1},{key2\:value2}", 
+            parameters, 
+            website_url=website_url, 
+            css_element=css_element, 
+            cookie=cookie
+        )
+
+    def create_tool(self) -> ScrapeElementFromWebsiteTool:
+        cookie_arrayofdicts = [{k: v} for k, v in (item.strip('{}').split(':') for item in self.parameters.get('cookie', '').split(','))] if self.parameters.get('cookie') else None
+        return ScrapeElementFromWebsiteTool(
+            website_url=self.parameters.get('website_url') if self.parameters.get('website_url') else None,
+            css_element=self.parameters.get('css_element').split(",") if self.parameters.get('css_element') else None,
+            cookie=cookie_arrayofdicts
+        )
+    
+class MyYahooFinanceNewsTool(MyTool):
+    def __init__(self, tool_id=None):
+        parameters = {}
+        super().__init__(tool_id, 'YahooFinanceNewsTool', "A tool that can be used to search Yahoo Finance News.", parameters)
+
+    def create_tool(self) -> YahooFinanceNewsTool:
+        return YahooFinanceNewsTool()
+    
+class MyAzureAIAssistantTool(MyTool):
+    def __init__(self, tool_id=None, assistant_name=None, api_key=None, api_version=None):
+        parameters = {
+            'assistant_name': {'mandatory': False},
+            'api_key': {'mandatory': False},
+            'api_version': {'mandatory': False}
+        }
+        description = "Interacts with Azure OpenAI Assistants for knowledge retrieval"
+        super().__init__(
+            tool_id, 
+            'AzureAIAssistantTool', 
+            description, 
+            parameters, 
+            assistant_name=assistant_name,
+            api_key=api_key,
+            api_version=api_version
+        )
+
+    def create_tool(self) -> AzureAIAssistantTool:
+        return AzureAIAssistantTool(
+            assistant_name=self.parameters.get('assistant_name'),
+            api_key=self.parameters.get('api_key'),
+            api_version=self.parameters.get('api_version') or "2024-05-01-preview"
+        )
+
+
+class MyCustomApiTool(MyTool):
+    def __init__(self, tool_id=None, base_url=None, headers=None, query_params=None):
+        parameters = {
+            'base_url': {'mandatory': False},
+            'headers': {'mandatory': False},
+            'query_params': {'mandatory': False}
+        }
+        super().__init__(tool_id, 'CustomApiTool', "A tool that can be used to make API calls with customizable parameters.", parameters, base_url=base_url, headers=headers, query_params=query_params)
+
+    def create_tool(self) -> CustomApiTool:
+        return CustomApiTool(
+            base_url=self.parameters.get('base_url') if self.parameters.get('base_url') else None,
+            headers=eval(self.parameters.get('headers')) if self.parameters.get('headers') else None,
+            query_params=self.parameters.get('query_params') if self.parameters.get('query_params') else None
+        )
+
+class MyCustomFileWriteTool(MyTool):
+    def __init__(self, tool_id=None, base_folder=None, filename=None):
+        parameters = {
+            'base_folder': {'mandatory': True},
+            'filename': {'mandatory': False}
+        }
+        super().__init__(tool_id, 'CustomFileWriteTool', "A tool that can be used to write a file to a specific folder.", parameters,base_folder=base_folder, filename=filename)
+
+    def create_tool(self) -> CustomFileWriteTool:
+        return CustomFileWriteTool(
+            base_folder=self.parameters.get('base_folder') if self.parameters.get('base_folder') else "workspace",
+            filename=self.parameters.get('filename') if self.parameters.get('filename') else None
+        )
+
+
+class MyCodeInterpreterTool(MyTool):
+    def __init__(self, tool_id=None):
+        parameters = {}
+        super().__init__(tool_id, 'CodeInterpreterTool', "This tool is used to give the Agent the ability to run code (Python3) from the code generated by the Agent itself. The code is executed in a sandboxed environment, so it is safe to run any code. Docker required.", parameters)
+
+    def create_tool(self) -> CodeInterpreterTool:
+        return CodeInterpreterTool()
+    
+
+class MyCustomCodeInterpreterTool(MyTool):
+    def __init__(self, tool_id=None,workspace_dir=None):
+        parameters = {
+            'workspace_dir': {'mandatory': False}
+        }
+        super().__init__(tool_id, 'CustomCodeInterpreterTool', "This tool is used to give the Agent the ability to run code (Python3) from the code generated by the Agent itself. The code is executed in a sandboxed environment, so it is safe to run any code. Worskpace folder is shared. Docker required.", parameters, workspace_dir=workspace_dir)
+
+    def create_tool(self) -> CustomCodeInterpreterTool:
+        return CustomCodeInterpreterTool(workspace_dir=self.parameters.get('workspace_dir') if self.parameters.get('workspace_dir') else "workspace")
+
+class MyCSVSearchToolEnhanced(MyTool):
+    def __init__(self, tool_id=None, csv=None):
+        parameters = {
+            'csv': {'mandatory': False}
+        }
+        super().__init__(tool_id, 'CSVSearchToolEnhanced', "A tool that can be used to semantic search a query from a CSV's content.", parameters, csv=csv)
+
+    def create_tool(self) -> CSVSearchToolEnhanced:
+        return CSVSearchToolEnhanced(csv=self.parameters.get('csv') if self.parameters.get('csv') else None)
+    
+class MyScrapeWebsiteToolEnhanced(MyTool):
+    def __init__(self, tool_id=None, website_url=None, cookies=None, show_urls=None, css_selector=None):
+        parameters = {
+            'website_url': {'mandatory': False},
+            'cookies': {'mandatory': False},
+            'show_urls': {'mandatory': False},
+            'css_selector': {'mandatory': False}
+        }
+        super().__init__(tool_id, 'ScrapeWebsiteToolEnhanced', "A tool that can be used to read website content.", parameters, website_url=website_url, cookies=cookies, show_urls=show_urls, css_selector=css_selector)
+
+    def create_tool(self) -> ScrapeWebsiteToolEnhanced:
+        return ScrapeWebsiteToolEnhanced(
+            website_url=self.parameters.get('website_url') if self.parameters.get('website_url') else None,
+            cookies=self.parameters.get('cookies') if self.parameters.get('cookies') else None,
+            show_urls=self.parameters.get('show_urls') if self.parameters.get('show_urls') else False,
+            css_selector=self.parameters.get('css_selector') if self.parameters.get('css_selector') else None
+        )
+
+# Register all tools here
+TOOL_CLASSES = {
+    'SerperDevTool': MySerperDevTool,
+    'WebsiteSearchTool': MyWebsiteSearchTool,
+    'ScrapeWebsiteTool': MyScrapeWebsiteTool,
+    'ScrapeWebsiteToolEnhanced': MyScrapeWebsiteToolEnhanced,
+    
+    'SeleniumScrapingTool': MySeleniumScrapingTool,
+    'ScrapeElementFromWebsiteTool': MyScrapeElementFromWebsiteTool,
+    'CustomApiTool': MyCustomApiTool,
+    'AzureAIAssistantTool': MyAzureAIAssistantTool,
+    'CodeInterpreterTool': MyCodeInterpreterTool,
+    'CustomCodeInterpreterTool': MyCustomCodeInterpreterTool,
+    'FileReadTool': MyFileReadTool,
+    'CustomFileWriteTool': MyCustomFileWriteTool,
+    'DirectorySearchTool': MyDirectorySearchTool,
+    'DirectoryReadTool': MyDirectoryReadTool,
+
+    'YoutubeVideoSearchTool': MyYoutubeVideoSearchTool,
+    'YoutubeChannelSearchTool' :MyYoutubeChannelSearchTool,
+    'GithubSearchTool': MyGithubSearchTool,
+    'CodeDocsSearchTool': MyCodeDocsSearchTool,
+    'YahooFinanceNewsTool': MyYahooFinanceNewsTool,
+
+    'TXTSearchTool': MyTXTSearchTool,
+    'CSVSearchTool': MyCSVSearchTool,
+    'CSVSearchToolEnhanced': MyCSVSearchToolEnhanced,
+    'DOCXSearchTool': MyDocxSearchTool, 
+    'EXASearchTool': MyEXASearchTool,
+    'JSONSearchTool': MyJSONSearchTool,
+    'MDXSearchTool': MyMDXSearchTool,
+    'PDFSearchTool': MyPDFSearchTool,
+    'PGSearchTool': MyPGSearchTool    
+}
+----------------------------------
+File: C:\Projects\CrewAI-Studio\app\pg_agents.py
+import streamlit as st
+from streamlit import session_state as ss
+from my_agent import MyAgent
+import db_utils
+
+class PageAgents:
+    def __init__(self):
+        self.name = "Agents"
+
+    def create_agent(self, crew=None):
+        agent = MyAgent()
+        if 'agents' not in ss:
+            ss.agents = [MyAgent]
+        ss.agents.append(agent)
+        agent.edit = True
+        db_utils.save_agent(agent)  # Save agent to database
+
+        if crew:
+            crew.agents.append(agent)
+            db_utils.save_crew(crew)
+
+        return agent
+
+    def draw(self):
+        with st.container():
+            st.subheader(self.name)
+            editing = False
+            if 'agents' not in ss:
+                ss.agents = db_utils.load_agents()  # Load agents from database
+            if 'crews' not in ss:
+                ss.crews = db_utils.load_crews()  # Load crews from database
+
+            # Dictionary to track agent assignment
+            agent_assignment = {agent.id: [] for agent in ss.agents}
+
+            # Assign agents to crews
+            for crew in ss.crews:
+                for agent in crew.agents:
+                    agent_assignment[agent.id].append(crew.name)
+
+            # Display agents grouped by crew in tabs
+            tabs = ["All Agents"] + ["Unassigned Agents"] + [crew.name for crew in ss.crews]
+            tab_objects = st.tabs(tabs)
+
+            # Display all agents
+            with tab_objects[0]:
+                st.markdown("#### All Agents")
+                for agent in ss.agents:
+                    agent.draw()
+                    if agent.edit:
+                        editing = True
+                st.button('Create agent', on_click=self.create_agent, disabled=editing, key="create_agent_all")
+
+            # Display unassigned agents
+            with tab_objects[1]:
+                st.markdown("#### Unassigned Agents")
+                unassigned_agents = [agent for agent in ss.agents if not agent_assignment[agent.id]]
+                for agent in unassigned_agents:
+                    unique_key = f"{agent.id}_unassigned"
+                    agent.draw(key=unique_key)
+                    if agent.edit:
+                        editing = True
+                st.button('Create agent', on_click=self.create_agent, disabled=editing, key="create_agent_unassigned")
+
+            # Display agents grouped by crew
+            for i, crew in enumerate(ss.crews, 2):
+                with tab_objects[i]:
+                    st.markdown(f"#### {crew.name}")
+                    assigned_agents = [agent for agent in crew.agents]
+                    for agent in assigned_agents:
+                        unique_key = f"{agent.id}_{crew.name}"
+                        agent.draw(key=unique_key)
+                        if agent.edit:
+                            editing = True
+                    st.button('Create agent', on_click=self.create_agent, disabled=editing, kwargs={'crew': crew}, key=f"create_agent_{crew.name}")
+
+            if len(ss.agents) == 0:
+                st.write("No agents defined yet.")
+                st.button('Create agent', on_click=self.create_agent, disabled=editing)
+
+
+----------------------------------
+File: C:\Projects\CrewAI-Studio\app\pg_crews.py
+import streamlit as st
+from streamlit import session_state as ss
+from my_crew import MyCrew
+import db_utils
+
+class PageCrews:
+    def __init__(self):
+        self.name = "Crews"
+
+    def create_crew(self):
+        crew = MyCrew()
+        if 'crews' not in ss:
+            ss.crews = [MyCrew]
+        ss.crews.append(crew)
+        crew.edit = True
+        db_utils.save_crew(crew)  # Save crew to database
+        return crew
+
+    def draw(self):
+        with st.container():
+            st.subheader(self.name)
+            editing = False
+            if 'crews' not in ss:
+                ss.crews = db_utils.load_crews()  # Load crews from database
+            for crew in ss.crews:
+                crew.draw()
+                if crew.edit:
+                    editing = True
+            if len(ss.crews) == 0:
+                st.write("No crews defined yet.")
+            st.button('Create crew', on_click=self.create_crew, disabled=editing)
+
+----------------------------------
+File: C:\Projects\CrewAI-Studio\app\pg_crew_run.py
+import re
+import streamlit as st
+from streamlit import session_state as ss
+import threading
+import ctypes
+import queue
+import time
+import traceback
+import os
+from console_capture import ConsoleCapture
+from db_utils import load_results, save_result
+from utils import format_result, generate_printable_view, rnd_id
+
+
+class PageCrewRun:
+    def __init__(self):
+        self.name = "Kickoff!"
+        self.maintain_session_state()
+        if 'results' not in ss:
+            ss.results = load_results()
+    
+    @staticmethod
+    def maintain_session_state():
+        defaults = {
+            'crew_thread': None,
+            'result': None,
+            'running': False,
+            'message_queue': queue.Queue(),
+            'selected_crew_name': None,
+            'placeholders': {},
+            'console_output': [],
+            'last_update': time.time(),
+            'console_expanded': True,
+        }
+        for key, value in defaults.items():
+            if key not in ss:
+                ss[key] = value
+
+    @staticmethod
+    def extract_placeholders(text):
+        return re.findall(r'\{(.*?)\}', text)
+
+    def get_placeholders_from_crew(self, crew):
+        placeholders = set()
+        attributes = ['description', 'expected_output', 'role', 'backstory', 'goal']
+        
+        for task in crew.tasks:
+            placeholders.update(self.extract_placeholders(task.description))
+            placeholders.update(self.extract_placeholders(task.expected_output))
+        
+        for agent in crew.agents:
+            for attr in attributes[2:]:
+                placeholders.update(self.extract_placeholders(getattr(agent, attr)))
+        
+        return placeholders
+
+    def run_crew(self, crewai_crew, inputs, message_queue):
+        if (str(os.getenv('AGENTOPS_ENABLED')).lower() in ['true', '1']) and not ss.get('agentops_failed', False):
+            import agentops
+            agentops.start_session()
+        try:
+            result = crewai_crew.kickoff(inputs=inputs)
+            message_queue.put({"result": result})
+        except Exception as e:
+            if (str(os.getenv('AGENTOPS_ENABLED')).lower() in ['true', '1']) and not ss.get('agentops_failed', False):                       
+                agentops.end_session()
+            stack_trace = traceback.format_exc()
+            print(f"Error running crew: {str(e)}\n{stack_trace}")
+            message_queue.put({"result": f"Error running crew: {str(e)}", "stack_trace": stack_trace})
+        finally:
+            if hasattr(ss, 'console_capture'):
+                ss.console_capture.stop()
+
+    def get_mycrew_by_name(self, crewname):
+        return next((crew for crew in ss.crews if crew.name == crewname), None)
+
+    def draw_placeholders(self, crew):
+        placeholders = self.get_placeholders_from_crew(crew)
+        if placeholders:
+            st.write('Placeholders to fill in:')
+            for placeholder in placeholders:
+                placeholder_key = f'placeholder_{placeholder}'
+                ss.placeholders[placeholder_key] = st.text_input(
+                    label=placeholder,
+                    key=placeholder_key,
+                    value=ss.placeholders.get(placeholder_key, ''),
+                    disabled=ss.running
+                )
+
+    def draw_crews(self):
+        if 'crews' not in ss or not ss.crews:
+            st.write("No crews defined yet.")
+            ss.selected_crew_name = None  # Reset selected crew name if there are no crews
+            return
+
+        # Check if the selected crew name still exists
+        if ss.selected_crew_name not in [crew.name for crew in ss.crews]:
+            ss.selected_crew_name = None
+
+        selected_crew_name = st.selectbox(
+            label="Select crew to run",
+            options=[crew.name for crew in ss.crews],
+            index=0 if ss.selected_crew_name is None else [crew.name for crew in ss.crews].index(ss.selected_crew_name) if ss.selected_crew_name in [crew.name for crew in ss.crews] else 0,
+            disabled=ss.running
+        )
+
+        if selected_crew_name != ss.selected_crew_name:
+            ss.selected_crew_name = selected_crew_name
+            st.rerun()
+
+        selected_crew = self.get_mycrew_by_name(ss.selected_crew_name)
+
+        if selected_crew:
+            selected_crew.draw(expanded=False,buttons=False)
+            self.draw_placeholders(selected_crew)
+            
+            if not selected_crew.is_valid(show_warning=True):
+                st.error("Selected crew is not valid. Please fix the issues.")
+            self.control_buttons(selected_crew)
+
+    def control_buttons(self, selected_crew):
+        if st.button('Run crew!', disabled=not selected_crew.is_valid() or ss.running):
+            inputs = {key.split('_')[1]: value for key, value in ss.placeholders.items()}
+            ss.result = None
+            
+            try:
+                crew = selected_crew.get_crewai_crew(full_output=True)
+            except Exception as e:
+                st.exception(e)
+                traceback.print_exc()
+                return
+
+            ss.console_capture = ConsoleCapture()
+            ss.console_capture.start()
+            ss.console_output = []  # Reset výstupu
+
+            ss.running = True
+            ss.crew_thread = threading.Thread(
+                target=self.run_crew,
+                kwargs={
+                    "crewai_crew": crew,
+                    "inputs": inputs,
+                    "message_queue": ss.message_queue
+                }
+            )
+            ss.crew_thread.start()
+            ss.result = None
+            ss.running = True            
+            st.rerun()
+
+        if st.button('Stop crew!', disabled=not ss.running):
+            self.force_stop_thread(ss.crew_thread)
+            if hasattr(ss, 'console_capture'):
+                ss.console_capture.stop()
+            ss.message_queue.queue.clear()
+            ss.running = False
+            ss.crew_thread = None
+            ss.result = None
+            st.success("Crew stopped successfully.")
+            st.rerun()
+
+    def serialize_result(self, result):
+        """
+        Serialize the crew result for database storage.
+        """
+        if isinstance(result, dict):
+            serialized = {}
+            for key, value in result.items():
+                if hasattr(value, 'raw'):
+                    serialized[key] = {
+                        'raw': value.raw,
+                        'type': 'CrewOutput'
+                    }
+                elif hasattr(value, '__dict__'):
+                    serialized[key] = {
+                        'data': value.__dict__,
+                        'type': value.__class__.__name__
+                    }
+                else:
+                    serialized[key] = value
+            return serialized
+        return str(result)
+
+    def display_result(self):
+        if ss.running and ss.page != "Kickoff!":
+            ss.page = "Kickoff!"
+            st.rerun()
+        console_container = st.empty()
+        
+        with console_container.container():
+            with st.expander("Console Output", expanded=False):
+                col1, col2 = st.columns([6,1])
+                with col2:
+                    if st.button("Clear console"):
+                        ss.console_output = []
+                        st.rerun()
+
+                console_text = "\n".join(ss.console_output)
+                st.code(console_text, language=None)
+
+        if ss.result is not None:
+            if isinstance(ss.result, dict):
+                # Save the result only if it's a new result (not already in ss.results)
+                from result import Result
+                
+                # Create a unique identifier for the current result based on its content
+                result_identifier = str(hash(str(ss.result)))
+                
+                # Check if this result has already been saved
+                if not hasattr(ss, 'saved_results'):
+                    ss.saved_results = set()
+                
+                if result_identifier not in ss.saved_results:
+                    # FIXED: Only get placeholders related to the current run
+                    # Get only relevant placeholders for this specific crew
+                    relevant_placeholders = {}
+                    
+                    # First, extract all placeholders for the current crew
+                    curr_crew = self.get_mycrew_by_name(ss.selected_crew_name)
+                    if curr_crew:
+                        crew_placeholders = self.get_placeholders_from_crew(curr_crew)
+                        # Only include placeholders that were actually used in this crew
+                        for placeholder in crew_placeholders:
+                            placeholder_key = f'placeholder_{placeholder}'
+                            if placeholder_key in ss.placeholders:
+                                relevant_placeholders[placeholder_key] = ss.placeholders[placeholder_key]
+                    
+                    # Create a new Result instance with serialized result
+                    result = Result(
+                        id=f"R_{rnd_id()}",
+                        crew_id=ss.selected_crew_name,
+                        crew_name=ss.selected_crew_name,
+                        inputs={key.split('_')[1]: value for key, value in relevant_placeholders.items()},
+                        result=self.serialize_result(ss.result)  # Serialize the result before saving
+                    )
+                    
+                    # Save to database and update session state
+                    save_result(result)
+                    if 'results' not in ss:
+                        ss.results = []
+                    ss.results.append(result)
+                    
+                    # Mark this result as saved
+                    ss.saved_results.add(result_identifier)
+
+                # Display the result
+                formatted_result = format_result(ss.result)
+                st.expander("Final output", expanded=True).write(formatted_result)
+                st.expander("Full output", expanded=False).write(ss.result)
+
+                # Add print button
+                # FIXED: Also use the relevant placeholders for the printable view
+                relevant_inputs = {}
+                curr_crew = self.get_mycrew_by_name(ss.selected_crew_name)
+                if curr_crew:
+                    crew_placeholders = self.get_placeholders_from_crew(curr_crew)
+                    for placeholder in crew_placeholders:
+                        placeholder_key = f'placeholder_{placeholder}'
+                        if placeholder_key in ss.placeholders:
+                            relevant_inputs[placeholder] = ss.placeholders[placeholder_key]
+                
+                html_content = generate_printable_view(
+                    ss.selected_crew_name,
+                    ss.result,
+                    relevant_inputs,
+                    formatted_result
+                )
+                if st.button("Open Printable View"):
+                    js = f"""
+                    <script>
+                        var printWindow = window.open('', '_blank');
+                        printWindow.document.write({html_content!r});
+                        printWindow.document.close();
+                    </script>
+                    """
+                    st.components.v1.html(js, height=0)
+
+            else:
+                st.error(ss.result)
+        elif ss.running and ss.crew_thread is not None:
+            with st.spinner("Running crew..."):
+                if hasattr(ss, 'console_capture'):
+                    new_output = ss.console_capture.get_output()
+                    if new_output:
+                        ss.console_output.extend(new_output)
+
+                try:
+                    message = ss.message_queue.get_nowait()
+                    ss.result = message
+                    ss.running = False
+                    if hasattr(ss, 'console_capture'):
+                        ss.console_capture.stop()
+                    st.rerun()
+                except queue.Empty:
+                    time.sleep(1)
+                    st.rerun()
+
+    @staticmethod
+    def force_stop_thread(thread):
+        if thread:
+            tid = ctypes.c_long(thread.ident)
+            if tid:
+                res = ctypes.pythonapi.PyThreadState_SetAsyncExc(tid, ctypes.py_object(SystemExit))
+                if res == 0:
+                    st.error("Nonexistent thread id")
+                else:
+                    st.success("Thread stopped successfully.")
+
+    def draw(self):
+        st.subheader(self.name)
+        self.draw_crews()
+        self.display_result()
+----------------------------------
+File: C:\Projects\CrewAI-Studio\app\pg_export_crew.py
+import streamlit as st
+from streamlit import session_state as ss
+import zipfile
+import os
+import re
+import json
+import shutil
+import db_utils
+from utils import escape_quotes
+from my_tools import TOOL_CLASSES
+from crewai import Process
+from my_crew import MyCrew
+from my_agent import MyAgent
+from my_task import MyTask
+from datetime import datetime
+
+class PageExportCrew:
+    def __init__(self):
+        self.name = "Import/export"
+
+    def extract_placeholders(self, text):
+        return re.findall(r'\{(.*?)\}', text)
+
+    def get_placeholders_from_crew(self, crew):
+        placeholders = set()
+        for task in crew.tasks:
+            placeholders.update(self.extract_placeholders(task.description))
+            placeholders.update(self.extract_placeholders(task.expected_output))
+        return list(placeholders)
+
+    def generate_streamlit_app(self, crew, output_dir):
+        agents = crew.agents
+        tasks = crew.tasks
+
+        # Check if any custom tools are used
+        custom_tools_used = any(tool.name in ["CustomApiTool", "CustomFileWriteTool", "CustomCodeInterpreterTool", "ScrapeWebsiteToolEnhanced", "CSVSearchToolEnhanced"] 
+                                for agent in agents for tool in agent.tools)
+
+        def json_dumps_python(obj):
+            if isinstance(obj, bool):
+                return str(obj)
+            return json.dumps(obj)
+
+        def format_tool_instance(tool):
+            tool_class = TOOL_CLASSES.get(tool.name)
+            if tool_class:
+                params = ', '.join([f'{key}={json_dumps_python(value)}' for key, value in tool.parameters.items() if value is not None])
+                return f'{tool.name}({params})' if params else f'{tool.name}()'
+            return None
+
+        agent_definitions = ",\n        ".join([
+            f"""
+Agent(
+    role={json_dumps_python(agent.role)},
+    backstory={json_dumps_python(agent.backstory)},
+    goal={json_dumps_python(agent.goal)},
+    allow_delegation={json_dumps_python(agent.allow_delegation)},
+    verbose={json_dumps_python(agent.verbose)},
+    tools=[{', '.join([format_tool_instance(tool) for tool in agent.tools])}],
+    llm=create_llm({json_dumps_python(agent.llm_provider_model)}, {json_dumps_python(agent.temperature)})
+)
+            """
+            for agent in agents
+        ])
+
+        task_definitions = ",\n        ".join([
+            f"""
+Task(
+    description={json_dumps_python(task.description)},
+    expected_output={json_dumps_python(task.expected_output)},
+    agent=next(agent for agent in agents if agent.role == {json_dumps_python(task.agent.role)}),
+    async_execution={json_dumps_python(task.async_execution)}
+)
+            """
+            for task in tasks
+        ])
+
+        placeholders = self.get_placeholders_from_crew(crew)
+        placeholder_inputs = "\n    ".join([
+            f'{placeholder} = st.text_input({json_dumps_python(placeholder.capitalize())})'
+            for placeholder in placeholders
+        ])
+        placeholders_dict = ", ".join([f'{json_dumps_python(placeholder)}: {placeholder}' for placeholder in placeholders])
+
+        manager_llm_definition = ""
+        if crew.process == Process.hierarchical and crew.manager_llm:
+            manager_llm_definition = f'manager_llm=create_llm({json_dumps_python(crew.manager_llm)})'
+        elif crew.process == Process.hierarchical and crew.manager_agent:
+            manager_llm_definition = f'manager_agent=next(agent for agent in agents if agent.role == {json_dumps_python(crew.manager_agent.role)})'
+        
+        app_content = f"""
+import streamlit as st
+from crewai import Agent, Task, Crew, Process
+from langchain_openai import ChatOpenAI
+from langchain_groq import ChatGroq
+from langchain_anthropic import ChatAnthropic
+from dotenv import load_dotenv
+import os
+from crewai_tools import *
+{'''from tools.CustomApiTool import CustomApiTool''' if custom_tools_used else ''}
+{'''from tools.CustomFileWriteTool import CustomFileWriteTool''' if custom_tools_used else ''}
+{'''from tools.CustomCodeInterpreterTool import CustomCodeInterpreterTool''' if custom_tools_used else ''}
+{'''from tools.ScrapeWebsiteToolEnhanced import ScrapeWebsiteToolEnhanced''' if custom_tools_used else ''}
+{'''from tools.CSVSearchToolEnhanced import CSVSearchToolEnhanced''' if custom_tools_used else ''}
+load_dotenv()
+
+def create_lmstudio_llm(model, temperature):
+    api_base = os.getenv('LMSTUDIO_API_BASE')
+    os.environ["OPENAI_API_KEY"] = "lm-studio"
+    os.environ["OPENAI_API_BASE"] = api_base
+    if api_base:
+        return ChatOpenAI(openai_api_key='lm-studio', openai_api_base=api_base, temperature=temperature)
+    else:
+        raise ValueError("LM Studio API base not set in .env file")
+
+def create_openai_llm(model, temperature):
+    safe_pop_env_var('OPENAI_API_KEY')
+    safe_pop_env_var('OPENAI_API_BASE')
+    load_dotenv(override=True)
+    api_key = os.getenv('OPENAI_API_KEY')
+    api_base = os.getenv('OPENAI_API_BASE', 'https://api.openai.com/v1/')
+    if api_key:
+        return ChatOpenAI(openai_api_key=api_key, openai_api_base=api_base, model_name=model, temperature=temperature)
+    else:
+        raise ValueError("OpenAI API key not set in .env file")
+
+def create_groq_llm(model, temperature):
+    api_key = os.getenv('GROQ_API_KEY')
+    if api_key:
+        return ChatGroq(groq_api_key=api_key, model_name=model, temperature=temperature)
+    else:
+        raise ValueError("Groq API key not set in .env file")
+
+def create_anthropic_llm(model, temperature):
+    api_key = os.getenv('ANTHROPIC_API_KEY')
+    if api_key:
+        return ChatAnthropic(anthropic_api_key=api_key, model_name=model, temperature=temperature)
+    else:
+        raise ValueError("Anthropic API key not set in .env file")
+
+def safe_pop_env_var(key):
+    try:
+        os.environ.pop(key)
+    except KeyError:
+        pass
+        
+LLM_CONFIG = {{
+    "OpenAI": {{
+        "create_llm": create_openai_llm
+    }},
+    "Groq": {{
+        "create_llm": create_groq_llm
+    }},
+    "LM Studio": {{
+        "create_llm": create_lmstudio_llm
+    }},
+    "Anthropic": {{
+        "create_llm": create_anthropic_llm
+    }}
+}}
+
+def create_llm(provider_and_model, temperature=0.1):
+    provider, model = provider_and_model.split(": ")
+    create_llm_func = LLM_CONFIG.get(provider, {{}}).get("create_llm")
+    if create_llm_func:
+        return create_llm_func(model, temperature)
+    else:
+        raise ValueError(f"LLM provider {{provider}} is not recognized or not supported")
+
+def load_agents():
+    agents = [
+        {agent_definitions}
+    ]
+    return agents
+
+def load_tasks(agents):
+    tasks = [
+        {task_definitions}
+    ]
+    return tasks
+
+def main():
+    st.title({json_dumps_python(crew.name)})
+
+    agents = load_agents()
+    tasks = load_tasks(agents)
+    crew = Crew(
+        agents=agents, 
+        tasks=tasks, 
+        process={json_dumps_python(crew.process)}, 
+        verbose={json_dumps_python(crew.verbose)}, 
+        memory={json_dumps_python(crew.memory)}, 
+        cache={json_dumps_python(crew.cache)}, 
+        max_rpm={json_dumps_python(crew.max_rpm)},
+        {manager_llm_definition}
+    )
+
+    {placeholder_inputs}
+
+    placeholders = {{
+        {placeholders_dict}
+    }}
+    with st.spinner("Running crew..."):
+        try:
+            result = crew.kickoff(inputs=placeholders)
+            with st.expander("Final output", expanded=True):
+                if hasattr(result, 'raw'):
+                    st.write(result.raw)                
+            with st.expander("Full output", expanded=False):
+                st.write(result)
+        except Exception as e:
+            st.error(f"An error occurred: {{str(e)}}")
+
+if __name__ == '__main__':
+    main()
+"""
+        with open(os.path.join(output_dir, 'app.py'), 'w') as f:
+            f.write(app_content)
+
+        if custom_tools_used:
+            source_path = os.path.join(os.path.dirname(__file__), 'tools')
+            dest_path = os.path.join(output_dir, 'tools')
+            shutil.copytree(source_path, dest_path)
+
+    def create_env_file(self, output_dir):
+        env_content = """
+# OPENAI_API_KEY="FILL-IN-YOUR-OPENAI-API-KEY"
+# OPENAI_API_BASE="OPTIONAL-FILL-IN-YOUR-OPENAI-API-BASE"
+# GROQ_API_KEY="FILL-IN-YOUR-GROQ-API-KEY"
+# ANTHROPIC_API_KEY="FILL-IN-YOUR-ANTHROPIC-API-KEY"
+# LMSTUDIO_API_BASE="http://localhost:1234/v1"
+"""
+        with open(os.path.join(output_dir, '.env'), 'w') as f:
+            f.write(env_content)
+
+    def create_shell_scripts(self, output_dir):
+        install_sh_content = """
+#!/bin/bash
+
+# Create a virtual environment
+python -m venv venv || { echo "Failed to create venv"; exit 1; }
+
+# Activate the virtual environment
+source venv/bin/activate || { echo "Failed to activate venv"; exit 1; }
+
+# Install requirements
+pip install -r requirements.txt || { echo "Failed to install requirements"; exit 1; }
+
+echo "Installation completed successfully."
+"""
+        with open(os.path.join(output_dir, 'install.sh'), 'w') as f:
+            f.write(install_sh_content)
+            os.chmod(os.path.join(output_dir, 'install.sh'), 0o755)
+
+        run_sh_content = """
+#!/bin/bash
+
+# Get the directory where the script is located
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+
+# Activate the virtual environment
+source "$SCRIPT_DIR/venv/bin/activate" || { echo "Failed to activate venv"; exit 1; }
+
+cd "$SCRIPT_DIR"
+
+streamlit run app.py --server.headless True
+"""
+        with open(os.path.join(output_dir, 'run.sh'), 'w') as f:
+            f.write(run_sh_content)
+            os.chmod(os.path.join(output_dir, 'run.sh'), 0o755)
+
+        install_bat_content = """
+@echo off
+
+:: Create a virtual environment
+python -m venv venv || (
+    echo Failed to create venv
+    exit /b 1
+)
+
+:: Activate the virtual environment
+call venv\\Scripts\\activate || (
+    echo Failed to activate venv
+    exit /b 1
+)
+
+:: Install requirements
+pip install -r requirements.txt || (
+    echo Failed to install requirements
+    exit /b 1
+)
+
+echo Installation completed successfully.
+"""
+        with open(os.path.join(output_dir, 'install.bat'), 'w') as f:
+            f.write(install_bat_content)
+
+        run_bat_content = """
+@echo off
+
+:: Activate the virtual environment
+call venv\\Scripts\\activate || (
+    echo Failed to activate venv
+    exit /b 1
+)
+
+:: Run the Streamlit app
+streamlit run app.py --server.headless true
+"""
+        with open(os.path.join(output_dir, 'run.bat'), 'w') as f:
+            f.write(run_bat_content)
+
+        # Copy the main project's requirements.txt
+        source_requirements = os.path.join(os.path.dirname(__file__), '..', 'requirements.txt')
+        dest_requirements = os.path.join(output_dir, 'requirements.txt')
+        shutil.copy2(source_requirements, dest_requirements)
+
+    def zip_directory(self, folder_path, output_path):
+        with zipfile.ZipFile(output_path, 'w') as zip_file:
+            for foldername, subfolders, filenames in os.walk(folder_path):
+                for filename in filenames:
+                    file_path = os.path.join(foldername, filename)
+                    arcname = os.path.relpath(file_path, folder_path)
+                    zip_file.write(file_path, arcname)
+
+    def create_export(self, crew_name):
+        output_dir = f"{crew_name}_app"
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+
+        selected_crew = next((crew for crew in ss.crews if crew.name == crew_name), None)
+        if selected_crew:
+            self.generate_streamlit_app(selected_crew, output_dir)
+            self.create_env_file(output_dir)
+            self.create_shell_scripts(output_dir)
+
+            zip_path = f"{crew_name}_app.zip"
+            self.zip_directory(output_dir, zip_path)
+            return zip_path
+
+    def export_crew_to_json(self, crew):
+        crew_data = {
+            'id': crew.id,
+            'name': crew.name,
+            'process': crew.process,
+            'verbose': crew.verbose,
+            'memory': crew.memory,
+            'cache': crew.cache,
+            'max_rpm': crew.max_rpm,
+            'manager_llm': crew.manager_llm,
+            'manager_agent': crew.manager_agent.id if crew.manager_agent else None,
+            'created_at': crew.created_at,
+            'agents': [],
+            'tasks': [],
+            'tools': []
+        }
+
+        tool_ids = set()
+
+        for agent in crew.agents:
+            agent_data = {
+                'id': agent.id,
+                'role': agent.role,
+                'backstory': agent.backstory,
+                'goal': agent.goal,
+                'allow_delegation': agent.allow_delegation,
+                'verbose': agent.verbose,
+                'cache': agent.cache,
+                'llm_provider_model': agent.llm_provider_model,
+                'temperature': agent.temperature,
+                'max_iter': agent.max_iter,
+                'tool_ids': [tool.tool_id for tool in agent.tools]
+            }
+            crew_data['agents'].append(agent_data)
+            tool_ids.update(agent_data['tool_ids'])
+
+        for task in crew.tasks:
+            task_data = {
+                'id': task.id,
+                'description': task.description,
+                'expected_output': task.expected_output,
+                'async_execution': task.async_execution,
+                'agent_id': task.agent.id if task.agent else None,
+                'context_from_async_tasks_ids': task.context_from_async_tasks_ids,
+                'created_at': task.created_at
+            }
+            crew_data['tasks'].append(task_data)
+
+        for tool_id in tool_ids:
+            tool = next((t for t in ss.tools if t.tool_id == tool_id), None)
+            if tool:
+                tool_data = {
+                    'tool_id': tool.tool_id,
+                    'name': tool.name,
+                    'description': tool.description,
+                    'parameters': tool.get_parameters()
+                }
+                crew_data['tools'].append(tool_data)
+
+        return json.dumps(crew_data, indent=2)
+    
+    def import_crew_from_json(self, crew_data):
+        # Create tools
+        for tool_data in crew_data['tools']:
+            tool_class = TOOL_CLASSES[tool_data['name']]
+            tool = tool_class(tool_id=tool_data['tool_id'])
+            tool.set_parameters(**tool_data['parameters'])
+            if tool not in ss.tools:
+                ss.tools.append(tool)
+                db_utils.save_tool(tool)
+
+        # Create agents
+        agents = []
+        for agent_data in crew_data['agents']:
+            agent = MyAgent(
+                id=agent_data['id'],
+                role=agent_data['role'],
+                backstory=agent_data['backstory'],
+                goal=agent_data['goal'],
+                allow_delegation=agent_data['allow_delegation'],
+                verbose=agent_data['verbose'],
+                cache=agent_data.get('cache', True),
+                llm_provider_model=agent_data['llm_provider_model'],
+                temperature=agent_data['temperature'],
+                max_iter=agent_data['max_iter'],
+                created_at=agent_data.get('created_at')
+            )
+            agent.tools = [next(tool for tool in ss.tools if tool.tool_id == tool_id) for tool_id in agent_data['tool_ids']]
+            agents.append(agent)
+            db_utils.save_agent(agent)
+
+        # Create tasks
+        tasks = []
+        for task_data in crew_data['tasks']:
+            task = MyTask(
+                id=task_data['id'],
+                description=task_data['description'],
+                expected_output=task_data['expected_output'],
+                async_execution=task_data['async_execution'],
+                agent=next((agent for agent in agents if agent.id == task_data['agent_id']), None),
+                context_from_async_tasks_ids=task_data['context_from_async_tasks_ids'],
+                created_at=task_data['created_at']
+            )
+            tasks.append(task)
+            db_utils.save_task(task)
+
+        # Create crew
+        crew = MyCrew(
+            id=crew_data['id'],
+            name=crew_data['name'],
+            process=crew_data['process'],
+            verbose=crew_data['verbose'],
+            memory=crew_data['memory'],
+            cache=crew_data['cache'],
+            max_rpm=crew_data['max_rpm'],
+            manager_llm=crew_data['manager_llm'],
+            manager_agent=next((agent for agent in agents if agent.id == crew_data['manager_agent']), None),
+            created_at=crew_data['created_at']
+        )
+        crew.agents = agents
+        crew.tasks = tasks
+        db_utils.save_crew(crew)
+
+        if crew not in ss.crews:
+            ss.crews.append(crew)
+
+        return crew
+
+    def draw(self):
+        st.subheader(self.name)
+
+        # Full JSON Export Button
+        if st.button("Export everything to json"):
+            current_datetime = datetime.now().strftime("%Y%m%d_%H%M%S")
+            file_path = f"all_crews_{current_datetime}.json"
+            db_utils.export_to_json(file_path)
+            with open(file_path, "rb") as fp:
+                st.download_button(
+                    label="Download All Crews JSON",
+                    data=fp,
+                    file_name=file_path,
+                    mime="application/json"
+                )
+
+        # JSON Import Button
+        uploaded_file = st.file_uploader("Import JSON file", type="json")
+        if uploaded_file is not None:
+            json_data = json.load(uploaded_file)
+            
+            if isinstance(json_data, list):  # Full database export
+                with open("uploaded_file.json", "w") as f:
+                    json.dump(json_data, f)
+                db_utils.import_from_json("uploaded_file.json")
+                st.success("Full database JSON file imported successfully!")
+            elif isinstance(json_data, dict) and 'id' in json_data:  # Single crew export
+                imported_crew = self.import_crew_from_json(json_data)
+                st.success(f"Crew '{imported_crew.name}' imported successfully!")
+            else:
+                st.error("Invalid JSON format. Please upload a valid crew or full database export file.")
+
+        if 'crews' not in ss or len(ss.crews) == 0:
+            st.write("No crews defined yet.")
+        else:
+            crew_names = [crew.name for crew in ss.crews]
+            selected_crew_name = st.selectbox("Select crew to export", crew_names)
+            
+            if st.button("Export singlepage app"):
+                zip_path = self.create_export(selected_crew_name)
+                with open(zip_path, "rb") as fp:
+                    st.download_button(
+                        label="Download Exported App",
+                        data=fp,
+                        file_name=f"{selected_crew_name}_app.zip",
+                        mime="application/zip"
+                    )        
+            if st.button("Export crew to JSON"):
+                selected_crew = next((crew for crew in ss.crews if crew.name == selected_crew_name), None)
+                if selected_crew:
+                    crew_json = self.export_crew_to_json(selected_crew)
+                    st.download_button(
+                        label="Download Crew JSON",
+                        data=crew_json,
+                        file_name=f"{selected_crew_name}_export.json",
+                        mime="application/json"
+                    )
+
+----------------------------------
+File: C:\Projects\CrewAI-Studio\app\pg_knowledge.py
+import streamlit as st
+from streamlit import session_state as ss
+from my_knowledge_source import MyKnowledgeSource
+import db_utils
+import os
+import shutil
+from pathlib import Path
+
+class PageKnowledge:
+    def __init__(self):
+        self.name = "Knowledge"
+
+    def create_knowledge_source(self):
+        knowledge_source = MyKnowledgeSource()
+        if 'knowledge_sources' not in ss:
+            ss.knowledge_sources = []
+        ss.knowledge_sources.append(knowledge_source)
+        knowledge_source.edit = True
+        db_utils.save_knowledge_source(knowledge_source)
+        return knowledge_source
+
+    def clear_knowledge(self):
+        # This will clear knowledge stores in CrewAI
+        # Get CrewAI home directory
+        home_dir = Path.home()
+        crewai_dir = home_dir / ".crewai"
+        
+        # Remove knowledge folder
+        knowledge_dir = crewai_dir / "knowledge"
+        if knowledge_dir.exists():
+            shutil.rmtree(knowledge_dir)
+            st.success("Knowledge stores cleared successfully!")
+        else:
+            st.info("No knowledge stores found to clear.")
+
+    def draw(self):
+        st.subheader(self.name)
+        
+        # Instruction
+        st.markdown("""
+        Knowledge sources are used to provide external information to agents.
+        You can create different types of knowledge sources and assign them to agents or crews.
+        """)
+        
+        # Create knowledge directory if it doesn't exist
+        os.makedirs("knowledge", exist_ok=True)
+        
+        # Clear knowledge button
+        st.button("Clear All Knowledge Stores", on_click=self.clear_knowledge, 
+                  help="This will clear all knowledge stores in CrewAI, removing cached embeddings")
+        
+        # Display existing knowledge sources
+        editing = False
+        if 'knowledge_sources' not in ss:
+            ss.knowledge_sources = db_utils.load_knowledge_sources()
+            
+        for knowledge_source in ss.knowledge_sources:
+            knowledge_source.draw()
+            if knowledge_source.edit:
+                editing = True
+                
+        if len(ss.knowledge_sources) == 0:
+            st.write("No knowledge sources defined yet.")
+            
+        st.button('Create Knowledge Source', on_click=self.create_knowledge_source, disabled=editing)
+----------------------------------
+File: C:\Projects\CrewAI-Studio\app\pg_results.py
+import streamlit as st
+from streamlit import session_state as ss
+from db_utils import delete_result, load_results
+from datetime import datetime
+from utils import rnd_id, format_result, generate_printable_view
+
+class PageResults:
+    def __init__(self):
+        self.name = "Results"
+
+    def draw(self):
+        st.subheader(self.name)
+
+        # Load results if not present in session state
+        if 'results' not in ss:
+            ss.results = load_results()
+
+        # Filters
+        col1, col2 = st.columns(2)
+        with col1:
+            crew_filter = st.multiselect(
+                "Filter by Crew",
+                options=list(set(r.crew_name for r in ss.results)),
+                default=[],
+                key="crew_filter"
+            )
+        with col2:
+            date_filter = st.date_input(
+                "Filter by Date",
+                value=None,
+                key="date_filter"
+            )
+
+        # Apply filters
+        filtered_results = ss.results
+        if crew_filter:
+            filtered_results = [r for r in filtered_results if r.crew_name in crew_filter]
+        if date_filter:
+            filter_date = datetime.combine(date_filter, datetime.min.time())
+            filtered_results = [r for r in filtered_results if datetime.fromisoformat(r.created_at).date() == date_filter]
+
+        # Sort results by creation time (newest first)
+        filtered_results = sorted(
+            filtered_results,
+            key=lambda x: datetime.fromisoformat(x.created_at),
+            reverse=True
+        )
+
+        # Display results
+        for result in filtered_results:
+            # Format inputs for display in expander title
+            input_summary = ""
+            input_items = list(result.inputs.items())
+            
+            # Handle different numbers of input fields
+            if len(input_items) == 0:
+                input_summary = ""
+            elif len(input_items) == 1:
+                # For just one input, show more of its value
+                key, value = input_items[0]
+                input_summary = f" | {key}: {value[:30]}" + ("..." if len(value) > 30 else "")
+            else:
+                # For multiple inputs, show brief summaries
+                max_chars = max(40 // len(input_items), 10)  # Adjust based on number of inputs
+                input_parts = []
+                
+                for key, value in input_items:
+                    if len(value) <= max_chars:
+                        input_parts.append(f"{key}: {value}")
+                    else:
+                        input_parts.append(f"{key}: {value[:max_chars]}...")
+                
+                input_summary = " | " + " | ".join(input_parts)
+            
+            # Create the expander with enhanced title
+            timestamp = datetime.fromisoformat(result.created_at).strftime('%Y-%m-%d %H:%M:%S')
+            expander_title = f"{result.crew_name} - {timestamp}{input_summary}"
+            
+            with st.expander(expander_title, expanded=False):
+                st.markdown("#### Inputs")
+                for key, value in result.inputs.items():
+                    st.text_input(key, value, disabled=True, key=rnd_id())
+
+                st.markdown("#### Result")
+                formatted_result = format_result(result.result)
+
+                # Show both rendered and raw versions using tabs
+                tab1, tab2 = st.tabs(["Rendered", "Raw"])
+                with tab1:
+                    st.markdown(formatted_result)
+                with tab2:
+                    st.code(formatted_result)
+
+                col1, col2 = st.columns([1, 1])
+                with col1:
+                    if st.button("Delete", key=f"delete_{result.id}"):
+                        delete_result(result.id)
+                        ss.results.remove(result)
+                        st.rerun()
+                with col2:
+                    # Create a button to open the printable view in a new tab
+                    html_content = generate_printable_view(
+                        result.crew_name,
+                        result.result,
+                        result.inputs,
+                        formatted_result,
+                        result.created_at
+                    )
+                    if st.button("Open Printable View", key=f"print_{result.id}"):
+                        js = f"""
+                        <script>
+                            var printWindow = window.open('', '_blank');
+                            printWindow.document.write({html_content!r});
+                            printWindow.document.close();
+                        </script>
+                        """
+                        st.components.v1.html(js, height=0)
+----------------------------------
+File: C:\Projects\CrewAI-Studio\app\pg_tasks.py
+import streamlit as st
+from streamlit import session_state as ss
+from my_task import MyTask
+import db_utils
+
+class PageTasks:
+    def __init__(self):
+        self.name = "Tasks"
+
+    def create_task(self, crew=None):
+        task = MyTask()   
+        if 'tasks' not in ss:
+            ss.tasks = [MyTask]
+        ss.tasks.append(task)
+        task.edit = True                
+        db_utils.save_task(task)  # Save task to database
+
+        if crew:
+            crew.tasks.append(task)
+            db_utils.save_crew(crew)
+
+        return task
+
+    def draw(self):
+        with st.container():
+            st.subheader(self.name)
+            editing = False
+            if 'tasks' not in ss:
+                ss.tasks = db_utils.load_tasks()  # Load tasks from database
+            if 'crews' not in ss:
+                ss.crews = db_utils.load_crews()  # Load crews from database
+
+            # Dictionary to track task assignment
+            task_assignment = {task.id: [] for task in ss.tasks}
+
+            # Assign tasks to crews
+            for crew in ss.crews:
+                for task in crew.tasks:
+                    task_assignment[task.id].append(crew.name)
+
+            # Display tasks grouped by crew in tabs
+            tabs = ["All Tasks"] + ["Unassigned Tasks"] + [crew.name for crew in ss.crews]
+            tab_objects = st.tabs(tabs)
+
+            # Display all tasks
+            with tab_objects[0]:
+                st.markdown("#### All Tasks")
+                for task in ss.tasks:
+                    task.draw()
+                    if task.edit:
+                        editing = True
+                st.button('Create task', on_click=self.create_task, disabled=editing, key="create_task_all")
+
+            # Display unassigned tasks
+            with tab_objects[1]:
+                st.markdown("#### Unassigned Tasks")
+                unassigned_tasks = [task for task in ss.tasks if not task_assignment[task.id]]
+                for task in unassigned_tasks:
+                    unique_key = f"{task.id}_unasigned"
+                    task.draw(key=unique_key)
+                    if task.edit:
+                        editing = True
+                st.button('Create task', on_click=self.create_task, disabled=editing, key="create_task_unassigned")
+
+            # Display tasks grouped by crew
+            for i, crew in enumerate(ss.crews, 2):
+                with tab_objects[i]:
+                    st.markdown(f"#### {crew.name}")
+                    assigned_tasks = [task for task in crew.tasks]
+                    for task in assigned_tasks:
+                        unique_key = f"{task.id}_{crew.name}"
+                        task.draw(key=unique_key)
+                        if task.edit:
+                            editing = True
+                    st.button('Create task', on_click=self.create_task, disabled=editing,kwargs={'crew': crew}, key=f"create_task_{crew.name}")
+
+
+            if len(ss.tasks) == 0:
+                st.write("No tasks defined yet.")
+                st.button('Create task', on_click=self.create_task, disabled=editing)
+
+
+----------------------------------
+File: C:\Projects\CrewAI-Studio\app\pg_tools.py
+import streamlit as st
+from utils import rnd_id
+from my_tools import TOOL_CLASSES
+from streamlit import session_state as ss
+import db_utils
+
+class PageTools:
+    def __init__(self):
+        self.name = "Tools"
+        self.available_tools = TOOL_CLASSES
+
+    def create_tool(self, tool_name):
+        tool_class = self.available_tools[tool_name]
+        tool_instance = tool_class(rnd_id())
+        if 'tools' not in ss:
+            ss.tools = []
+        ss.tools.append(tool_instance)
+        db_utils.save_tool(tool_instance)  # Save tool to database
+
+    def remove_tool(self, tool_id):
+        ss.tools = [tool for tool in ss.tools if tool.tool_id != tool_id]
+        db_utils.delete_tool(tool_id)
+        st.rerun()
+
+    def set_tool_parameter(self, tool_id, param_name, value):
+        if value == "":
+            value = None
+        for tool in ss.tools:
+            if tool.tool_id == tool_id:
+                tool.set_parameters(**{param_name: value})
+                db_utils.save_tool(tool)
+                break
+
+    def get_tool_display_name(self, tool):
+        first_param_name = tool.get_parameter_names()[0] if tool.get_parameter_names() else None
+        first_param_value = tool.parameters.get(first_param_name, '') if first_param_name else ''
+        return f"{tool.name} ({first_param_value if first_param_value else tool.tool_id})"
+
+    def draw_tools(self):
+        c1,c2 = st.columns([1, 3])
+        #st.write("Available Tools:")
+        with c1:
+            for tool_name in self.available_tools.keys():
+                tool_class = self.available_tools[tool_name]
+                tool_instance = tool_class()
+                tool_description = tool_instance.description
+                if st.button(f"{tool_name}", key=f"enable_{tool_name}", help=tool_description):
+                    self.create_tool(tool_name)
+        with c2:
+            if 'tools' in ss:
+                st.write("##### Enabled Tools")
+                for tool in ss.tools:
+                    display_name = self.get_tool_display_name(tool)
+                    is_complete = tool.is_valid()
+                    expander_title = display_name if is_complete else f"❗ {display_name}"
+                    with st.expander(expander_title):
+                        st.write(tool.description)
+                        for param_name in tool.get_parameter_names():
+                            param_value = tool.parameters.get(param_name, "")
+                            placeholder = "Required" if tool.is_parameter_mandatory(param_name) else "Optional"
+                            new_value = st.text_input(f"{param_name}", value=param_value, key=f"{tool.tool_id}_{param_name}", placeholder=placeholder)
+                            if new_value != param_value:
+                                self.set_tool_parameter(tool.tool_id, param_name, new_value)
+                        if st.button(f"Remove", key=f"remove_{tool.tool_id}"):
+                            self.remove_tool(tool.tool_id)
+
+    def draw(self):
+        st.subheader(self.name)
+        self.draw_tools()
+
+----------------------------------
+File: C:\Projects\CrewAI-Studio\app\result.py
+from datetime import datetime
+from typing import Optional, Dict, Any
+
+class Result:
+    def __init__(self, 
+                 id: str,
+                 crew_id: str,
+                 crew_name: str,
+                 inputs: Dict[str, str],
+                 result: Any,
+                 created_at: Optional[str] = None):
+        self.id = id
+        self.crew_id = crew_id
+        self.crew_name = crew_name
+        self.inputs = inputs
+        self.result = result
+        self.created_at = created_at or datetime.now().isoformat()
+----------------------------------
+File: C:\Projects\CrewAI-Studio\app\utils.py
+import random
+import string
+from streamlit import markdown
+import markdown as md
+from datetime import datetime
+
+def rnd_id(length=8):
+    characters = string.ascii_letters + string.digits
+    random_text = ''.join(random.choice(characters) for _ in range(length))
+    return random_text
+
+def escape_quotes(s):
+    return s.replace('"', '\\"').replace("'", "\\'")
+
+def fix_columns_width():
+    markdown("""
+            <style>
+                div[data-testid="column"] {
+                    width: fit-content !important;
+                    flex: unset;
+                }
+                div[data-testid="column"] * {
+                    width: fit-content !important;
+                }
+            </style>
+            """, unsafe_allow_html=True)
+
+def generate_printable_view(crew_name, result, inputs, formatted_result, created_at=None):
+    """
+    Generates a simple HTML view for printing.
+    """
+    if created_at is None:
+        created_at = datetime.now().isoformat()
+    created_at_str = datetime.fromisoformat(created_at).strftime('%Y-%m-%d %H:%M:%S')
+    markdown_html = md.markdown(formatted_result)
+
+    html_content = f"""
+    <html>
+        <head>
+            <title>CrewAI-Studio result - {crew_name}</title>
+            <style>
+                body {{
+                    font-family: 'Arial', sans-serif;
+                    padding: 20px;
+                    max-width: 800px;
+                    margin: auto;
+                }}
+                h1 {{
+                    color: #f05252;
+                }}
+                .section {{
+                    margin: 20px 0;
+                }}
+                .input-item {{
+                    margin: 5px 0;
+                }}
+                h2, h3, h4, h5, h6 {{
+                    color: #333;
+                    margin-top: 1em;
+                }}
+                code {{
+                    background-color: #f5f5f5;
+                    padding: 2px 4px;
+                    border-radius: 3px;
+                    font-family: 'Consolas', 'Courier New', monospace;
+                }}
+                pre code {{
+                    background-color: #f5f5f5;
+                    display: block;
+                    padding: 10px;
+                    white-space: pre-wrap;
+                    font-family: 'Consolas', 'Courier New', monospace;
+                }}
+                @media print {{
+                    #printButton {{
+                        display: none;
+                    }}
+                    .page-break {{
+                        page-break-before: always;
+                    }}
+                    body {{
+                        -webkit-print-color-adjust: exact;
+                        print-color-adjust: exact;
+                    }}
+                }}
+            </style>
+        </head>
+        <body>
+            <button id="printButton" onclick="window.print();" style="margin-bottom: 20px;">
+                Print
+            </button>
+
+            <h1>CrewAI-Studio result</h1>
+            <div class="section">
+                <h2>Crew Information</h2>
+                <p><strong>Crew Name:</strong> {crew_name}</p>
+                <p><strong>Created:</strong> {created_at_str}</p>
+            </div>
+            <div class="section">
+                <h2>Inputs</h2>
+                {''.join(f'<div class="input-item"><strong>{k}:</strong> {v}</div>' for k, v in inputs.items())}
+            </div>
+            <div class="page-break"></div>
+            <div class="section">
+                {markdown_html}
+            </div>
+        </body>
+    </html>
+    """
+    return html_content
+
+def format_result(result):
+    """
+    Returns the result in a string format, extracting relevant data from nested structures if needed.
+    """
+    if isinstance(result, dict):
+        if 'result' in result:
+            if isinstance(result['result'], dict):
+                if 'final_output' in result['result']:
+                    return result['result']['final_output']
+                elif 'raw' in result['result']:
+                    return result['result']['raw']
+                else:
+                    return str(result['result'])
+            elif hasattr(result['result'], 'raw'):
+                return result['result'].raw
+        return str(result)
+    return str(result)
+
+----------------------------------
+File: C:\Projects\CrewAI-Studio\docker-compose-no_env.yaml
+services:
+  db:
+    image: postgres:15
+    container_name: crewai_db
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-crewaiuser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-secret123}
+      POSTGRES_DB: ${POSTGRES_DB:-crewai}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    restart: always
+
+  web:
+    build: .
+    container_name: crewai_studio
+    depends_on:
+      - db
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_API_BASE: ${OPENAI_API_BASE:-}
+      OPENAI_PROXY_MODELS: ${OPENAI_PROXY_MODELS:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      LMSTUDIO_API_BASE: ${LMSTUDIO_API_BASE:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      AGENTOPS_API_KEY: ${AGENTOPS_API_KEY:-}
+      AGENTOPS_ENABLED: ${AGENTOPS_ENABLED:-False}
+      OLLAMA_HOST: ${OLLAMA_HOST:-}
+      OLLAMA_MODELS: ${OLLAMA_MODELS:-}
+      SERPER_API_KEY: ${SERPER_API_KEY:-}
+      DB_URL: postgresql://${POSTGRES_USER:-crewaiuser}:${POSTGRES_PASSWORD:-secret123}@db:5432/${POSTGRES_DB:-crewai}
+    ports:
+      - "${WEB_PORT:-8501}:8501"
+    restart: always
+
+volumes:
+  db-data:
+
+----------------------------------
+File: C:\Projects\CrewAI-Studio\docker-compose.yaml
+version: '3.9'
+
+services:
+  db:
+    image: postgres:15
+    container_name: crewai_db
+    env_file:
+      - .env
+    environment:
+      POSTGRES_USER: crewai_user
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: crewai
+    volumes:
+      - ./data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  # The Streamlit app
+  web:
+    build: .
+    container_name: crewai_studio
+    depends_on:
+      - db
+    env_file:
+      - .env
+    environment:
+      - DB_URL=postgresql://crewai_user:secret@db:5432/crewai
+    ports:
+      - "8501:8501"
+
+----------------------------------
+File: C:\Projects\CrewAI-Studio\README.md
+# CrewAI Studio
+
+Welcome to CrewAI Studio! This application provides a user-friendly interface written in Streamlit for interacting with CrewAI, suitable even for those who don't want to write any code. Follow the steps below to install and run the application using Docker/docker-compose or Conda/venv.
+
+## Features
+
+- **Multi-platform support**: Works on Windows, Linux and MacOS.
+- **No coding required**: User-friendly interface for interacting with CrewAI.
+- **Conda and virtual environment support**: Choose between Conda and a Python virtual environment for installation.
+- **Results history**: You can view previous results.
+- **Knowledge sources**: You can add knowledge sources for your crews
+- **CrewAI tools** You can use crewai tools to interact with real world. ~~Crewai studio uses a forked version of crewai-tools with some bugfixes and enhancements (https://github.com/strnad/crewAI-tools)~~ (bugfixes already merged to crewai-tools)
+- **Custom Tools** Custom tools for calling APIs, writing files, enhanced code interpreter, enhanced web scraper... More will be added soon
+- **LLM providers supported**: Currently OpenAI, Azure OpenAI, Groq, Anthropic, ollama, Grok and LM Studio backends are supported. OpenAI key is probably still needed for embeddings in many tools. Don't forget to load an embedding model when using LM Studio.
+- **Single Page app export**: Feature to export crew as simple single page streamlit app.
+- **Threaded crew run**: Crews can run in background and can be stopped.
+
+## Support CrewAI Studio
+
+Your support helps fund the development and growth of our project. Every contribution is greatly appreciated!
+
+### Donate with Bitcoin
+[![Donate with Bitcoin](https://www.blockonomics.co/img/pay_with_bitcoin_medium.png)](https://pay-link.s3.us-west-2.amazonaws.com/index.html?uid=b14b42846ecd40fe)
+
+### Sponsor via GitHub
+[![Sponsor on GitHub](https://img.shields.io/badge/Sponsor-GitHub-ff69b4?style=for-the-badge&logo=github)](https://github.com/sponsors/strnad)
+
+
+## Screenshots
+
+<img src="https://raw.githubusercontent.com/strnad/CrewAI-Studio/main/img/ss1.png" alt="crews definition" style="width:50%;"/><img src="https://raw.githubusercontent.com/strnad/CrewAI-Studio/main/img/ss2.png" alt="kickoff" style="width:50%;"/>
+<img src="https://raw.githubusercontent.com/strnad/CrewAI-Studio/main/img/ss3.png" alt="kickoff" style="width:50%;"/><img src="https://raw.githubusercontent.com/strnad/CrewAI-Studio/main/img/ss4.png" alt="kickoff" style="width:50%;"/>
+<img src="https://raw.githubusercontent.com/strnad/CrewAI-Studio/main/img/ss5.png" alt="kickoff" style="width:50%;"/><img src="https://raw.githubusercontent.com/strnad/CrewAI-Studio/main/img/ss6.png" alt="kickoff" style="width:50%;"/>
+
+## Installation
+
+### Using Virtual Environment
+
+**For Virtual Environment**: Ensure you have Python installed. If you dont have python instaled, you can simply use the conda installer.
+
+#### On Linux or MacOS
+
+1. **Clone the repository (or use downloaded ZIP file)**:
+
+   ```bash
+   git clone https://github.com/strnad/CrewAI-Studio.git
+   cd CrewAI-Studio
+   ```
+
+2. **Run the installation script**:
+
+   ```bash
+   ./install_venv.sh
+   ```
+
+3. **Run the application**:
+   ```bash
+   ./run_venv.sh
+   ```
+
+#### On Windows
+
+1. **Clone the repository (or use downloaded ZIP file)**:
+
+   ```powershell
+   git clone https://github.com/strnad/CrewAI-Studio.git
+   cd CrewAI-Studio
+   ```
+
+2. **Run the Conda installation script**:
+
+   ```powershell
+   ./install_venv.bat
+   ```
+
+3. **Run the application**:
+   ```powershell
+   ./run_venv.bat
+   ```
+
+### Using Conda
+
+Conda will be installed locally in the project folder. No need for a pre-existing Conda installation.
+
+#### On Linux
+
+1. **Clone the repository (or use downloaded ZIP file)**:
+
+   ```bash
+   git clone https://github.com/strnad/CrewAI-Studio.git
+   cd CrewAI-Studio
+   ```
+
+2. **Run the Conda installation script**:
+
+   ```bash
+   ./install_conda.sh
+   ```
+
+3. **Run the application**:
+   ```bash
+   ./run_conda.sh
+   ```
+
+#### On Windows
+
+1. **Clone the repository (or use downloaded ZIP file)**:
+
+   ```powershell
+   git clone https://github.com/strnad/CrewAI-Studio.git
+   cd CrewAI-Studio
+   ```
+
+2. **Run the Conda installation script**:
+
+   ```powershell
+   ./install_conda.bat
+   ```
+
+3. **Run the application**:
+   ```powershell
+   ./run_conda.bat
+   ```
+
+### One-Click Deployment
+
+[![Deploy to RepoCloud](https://d16t0pc4846x52.cloudfront.net/deploylobe.svg)](https://repocloud.io/details/?app_id=318)
+
+## Running with Docker Compose
+
+To quickly set up and run CrewAI-Studio using Docker Compose, follow these steps:
+
+### Prerequisites
+
+- Ensure [Docker](https://docs.docker.com/get-docker/) and [Docker Compose](https://docs.docker.com/compose/install/) are installed on your system.
+
+### Steps
+
+1. Clone the repository:
+```
+git clone https://github.com/strnad/CrewAI-Studio.git
+cd CrewAI-Studio
+```
+
+2. Create a .env file for configuration.  Edit for your own configuration:
+```
+cp .env_example .env
+```
+
+3. Start the application with Docker Compose:
+```
+docker-compose up --build
+```
+
+4. Access the application: http://localhost:8501
+
+## Configuration
+
+Before running the application, ensure you update the `.env` file with your API keys and other necessary configurations. An example `.env` file is provided for reference.
+
+## Troubleshooting
+In case of problems:
+- Delete the `venv/miniconda` folder and reinstall `crewai-studio`.
+- Rename `crewai.db` (it contains your crews but sometimes new versions can break compatibility).
+- Raise an issue and I will help you.
+
+## Video tutorial
+Video tutorial on CrewAI Studio made by Josh Poco
+
+[![FREE CrewAI Studio GUI EASY AI Agent Creation!🤖 Open Source AI Agent Orchestration Self Hosted](https://img.youtube.com/vi/3Uxdggt88pY/hqdefault.jpg)](https://www.youtube.com/watch?v=3Uxdggt88pY)
+
+## Star History
+
+<a href="https://star-history.com/#strnad/CrewAI-Studio&Date">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=strnad/CrewAI-Studio&type=Date&theme=dark" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=strnad/CrewAI-Studio&type=Date" />
+   <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=strnad/CrewAI-Studio&type=Date" />
+ </picture>   
+</a>
+
+----------------------------------
+File: C:\Projects\CrewAI-Studio\requirements.txt
+crewai
+crewai-tools
+langchain
+langchain-community
+langchain-openai
+langchain-groq
+langchain-anthropic
+langchain-ollama
+streamlit
+python-dotenv
+pdfminer.six
+sqlalchemy
+psycopg2-binary
+snowflake-connector-python
+markdown
+docling
+azure.identity
+----------------------------------
+
